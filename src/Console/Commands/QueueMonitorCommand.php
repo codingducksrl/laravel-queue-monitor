@@ -33,6 +33,14 @@ class QueueMonitorCommand extends Command {
                 : 'Queue monitoring is enabled for: '.implode(', ', $connections).'.'
         );
 
+        $this->components->twoColumnDetail('Sink', $monitor->sink());
+        $this->components->twoColumnDetail('Counter store', $monitor->counterStore() ?? 'default');
+        $this->components->twoColumnDetail('Job class cap', (string) $monitor->maxJobClasses());
+
+        foreach ($monitor->sampledQueues() as [$connection, $queue]) {
+            $this->components->twoColumnDetail('Sampled queue', "{$connection}:{$queue}");
+        }
+
         return self::SUCCESS;
     }
 }

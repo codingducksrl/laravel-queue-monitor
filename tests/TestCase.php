@@ -33,5 +33,17 @@ abstract class TestCase extends Orchestra {
         $connection = $app['config']->get('database.default');
 
         $app['config']->set("database.connections.{$connection}.foreign_key_constraints", true);
+
+        // The failed job provider otherwise points at a sqlite file that the
+        // test environment never creates.
+        $app['config']->set('queue.failed.database', $connection);
+    }
+
+    /**
+     * The jobs, job_batches and failed_jobs tables the queue drivers and the
+     * failed job provider are exercised against.
+     */
+    protected function defineDatabaseMigrationsAfterDatabaseRefreshed(): void {
+        $this->loadLaravelMigrations();
     }
 }
