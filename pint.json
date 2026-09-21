@@ -1,0 +1,26 @@
+{
+    "preset": "laravel",
+    "rules": {
+        "class_definition": false,
+        "braces_position": {
+            "classes_opening_brace": "same_line",
+            "anonymous_classes_opening_brace": "same_line",
+            "functions_opening_brace": "same_line",
+            "anonymous_functions_opening_brace": "same_line",
+            "control_structures_opening_brace": "same_line",
+            "allow_single_line_empty_anonymous_classes": false,
+            "allow_single_line_anonymous_functions": false
+        },
+        "phpdoc_align": {
+            "align": "vertical"
+        },
+        "phpdoc_separation": {
+            "groups": [
+                ["deprecated", "link", "see", "since"],
+                ["author", "copyright", "license"],
+                ["category", "package", "subpackage"],
+                ["property", "property-read", "property-write"]
+            ]
+        }
+    }
+}

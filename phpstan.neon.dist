@@ -1,0 +1,14 @@
+parameters:
+    level: 10
+    paths:
+        - src
+        - config
+        - database
+    tmpDir: build/phpstan
+    checkModelProperties: true
+
+    # This is a package, so Larastan cannot infer the config path from an
+    # application base path; point it at our own config directory so `env()`
+    # is allowed there and nowhere else.
+    configDirectories:
+        - %currentWorkingDirectory%/config
