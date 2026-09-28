@@ -9,8 +9,9 @@ How the package works inside. Installing and using it is covered in the [README]
 ## Two paths, one store
 
 Every process that dispatches or works jobs counts events into the counter store. Once a minute,
-on one server, the sampler reads each queue's depth from its driver, drains the counters and hands
-the batch to the sink. The two paths never call each other; the store is all they share.
+on one server, the sampler reads each queue's depth from its driver and its counters from the
+store, hands the batch to the sink, then subtracts what it published. The two paths never call
+each other; the store is all they share.
 
 ```mermaid
 flowchart LR
@@ -21,7 +22,8 @@ flowchart LR
         SC["SampleCommand"] --> COL["Collector"]
     end
     RJM -- "increment" --> CS[("Counter store<br/>Redis or DynamoDB")]
-    COL -- "read, then commit" --> CS
+    COL -- "read" --> CS
+    SC -- "lock, commit" --> CS
     COL -- "depth" --> QD[("Queue driver")]
     COL -- "count" --> FJ[("Failed job provider")]
     SC -- "write" --> SINK["MetricSink<br/>EmfSink by default"]
@@ -38,7 +40,7 @@ flowchart LR
 | [`Counters`](../src/Counters.php) | Everything in the counter store: counters, class registry, parking, drain, sampler lock. |
 | [`Collector`](../src/Collector.php) | One pair's metrics, and the readings to commit once they are published. |
 | [`SampleCommand`](../src/Console/Commands/SampleCommand.php) | Lock, collect, write, commit, pair by pair. |
-| [`StatusCommand`](../src/Console/Commands/StatusCommand.php) | Builds every dependency once and prints the setup. |
+| [`StatusCommand`](../src/Console/Commands/StatusCommand.php) | Builds the queue connections, the counter store and the sink, and prints the setup. |
 | [`MetricSinkManager`](../src/MetricSinkManager.php) | Laravel `Manager` of sinks; builds the `emf` driver. |
 | [`MetricSink`](../src/MetricSink.php), [`Metric`](../src/Metric.php), [`MetricName`](../src/MetricName.php) | The sink contract, what it receives, the metric names. |
 | [`EmfSink`](../src/Sinks/EmfSink.php) | CloudWatch Embedded Metric Format on stdout. |
@@ -74,13 +76,14 @@ classDiagram
 
 ## Wiring
 
-`register()` merges the config and binds everything as a singleton, so a process holds one
-listener, one monitor and one store client.
+`register()` merges the config and binds the monitor, the listener, the sink manager, the sink and
+`Counters` as singletons, so a process holds one of each. `Collector` is built per run.
 
 - `MetricSink` is `MetricSinkManager::sink()`: the driver named by `queue-monitor.sink`.
 - `Counters` is built on first use. It takes `counters.store` (else the default store), runs
   `guardCounterStore()`, and wraps the bare store in a `Repository` without an event dispatcher, so
-  cache listeners such as Pulse and Telescope never see counter traffic. Its registry holds
+  the application's cache event listeners (Pulse, Telescope) never see counter traffic; Telescope's
+  Redis watcher, which listens to Redis commands, still does. Its registry holds
   `4 × max_job_classes` names (see [the class registry](counting.md#the-class-registry)).
 
 `boot()` registers the listeners only while `queue-monitor.enabled` is true, so a disabled package
@@ -88,11 +91,11 @@ costs nothing on the hot path. The commands and the `queue-monitor-config` publi
 registered in the console only.
 
 `guardCounterStore()` accepts DynamoDB, and Redis when its `connection` and `lock_connection` are
-both defined under `database.redis` and neither is the connection of a `redis` queue. Counters need
-atomic increments and locks shared by every process, which rules out the other stores. Redis bulk
-dispatch pushes inside a pipeline and `MULTI` on the queue's connection while `JobQueued` fires, so a
-counter command sent on that connection would only be queued and return no count. The guard stands
-down under `runningUnitTests()`. `Counters` is resolved inside the listener's guard, so a refused
+both defined under `database.redis` (or `database.redis.clusters`) and neither is the connection
+of a `redis` queue; it refuses every other store. The connection rule exists because Redis bulk
+dispatch pushes inside a pipeline and `MULTI` on the queue's connection while `JobQueued` fires, so
+a counter command sent on that connection would only be queued and return no count. The guard
+stands down under `runningUnitTests()`. `Counters` is resolved inside the listener's guard, so a refused
 store is reported instead of thrown into `dispatch()`.
 
 ## Vocabulary

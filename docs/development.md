@@ -38,19 +38,21 @@ lowest, against a Redis 8 service.
 `TestCase` enables monitoring for `database:default`, points the failed job provider at the test
 database, sets an app key (Laravel Cloud's failed job provider needs an encrypter) and loads
 Laravel's migrations for the `jobs`, `job_batches` and `failed_jobs` tables. The Workbench jobs
-`SendInvoice`, `SyncContact` and `FailInvoice` are real jobs the feature tests dispatch and work
-with `queue:work --once`.
+`SendInvoice`, `SyncContact` and `FailInvoice` are the real jobs the feature tests push;
+`SendInvoice` and `FailInvoice` are also worked with `queue:work --once`.
 
 - `RecordingSink` is bound as `MetricSink` by the sampler tests. `value($name, $class)` returns what
   was published for that metric and class, and asserts it was published at most once.
-- `SpyStore` records one entry per store round trip; it is how the hot-path cost is pinned.
+- `SpyStore` logs every store call the code makes, a lock once when it is created; it is how the
+  hot-path cost is pinned.
 - The counter store guard stands down under `runningUnitTests()`. Tests that need it set
   `app()['env'] = 'production'` and put `testing` back in `afterEach`, or the migration rollback
   would ask for confirmation.
 
 ## Conventions
 
-- `declare(strict_types=1)` in every file.
+- `declare(strict_types=1)` in `src/`, `config/` and `tests/`; the arch test enforces it for the
+  package namespace.
 - `env()` only in `config/`: the arch test forbids it elsewhere, and Larastan's `configDirectories`
   points at `config/`.
 - Pint's Laravel preset, with opening braces on the same line (`pint.json`).
@@ -60,8 +62,8 @@ with `queue:work --once`.
 What the tests hold the code to. A change that breaks one needs a reason.
 
 1. The listener never throws into the application.
-2. A pair is drained only under a lock the run still holds, after the sink returned, by exactly
-   what was read. Counters are never reset or deleted.
+2. A pair is drained only after its lock was refreshed and the sink returned, by exactly what was
+   read. Counters are never reset or deleted.
 3. One dimension set per EMF document.
 4. Per-class values add up to the queue total, and the kept classes do not change between windows.
 5. A registered counter costs one round trip per event between re-check marks.

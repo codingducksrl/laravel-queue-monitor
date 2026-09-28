@@ -36,6 +36,9 @@ QUEUE_MONITOR_CACHE_STORE=metrics
 'queues' => ['redis' => ['default', 'high']],
 ```
 
+Every process that dispatches or works jobs counts its own events, so web servers, workers and
+the scheduler all need these settings, not only the server that samples.
+
 Then schedule the sampler:
 
 ```php
@@ -82,9 +85,8 @@ jobs adds N round trips; see [Cost](#cost) for classes past the cap. Counting ne
 into your code: a failure is reported to your exception handler and counting stands down for a
 minute in that process.
 
-`queue-monitor:sample` then reads the gauges, drains the counters, and hands one batch per
-queue to the sink. It reads a counter, publishes it, and only then subtracts exactly what it
-read, so an increment landing mid-drain survives and a crash re-publishes rather than loses.
+`queue-monitor:sample` then reads the gauges and the counters, and hands one batch per queue
+to the sink. It reads a counter, publishes it, and only then subtracts exactly what it read, so an increment landing mid-drain survives and a crash re-publishes rather than loses.
 A queue that fails is reported and skipped; the others are still published.
 
 ## Metrics
@@ -102,8 +104,8 @@ Published against `Connection` and `Queue`:
 | `JobsFailed` | Count | permanently failed since the last sample |
 
 `JobsQueued`, `JobsCompleted` and `JobsFailed` are also published with a `JobClass`
-dimension: the job's display name, which is its class unless it defines `displayName()`. A
-display name becomes a permanent CloudWatch dimension, so keep IDs and personal data out of
+dimension: the job's display name, which is its class unless it defines `displayName()`, cut
+to 255 characters. A display name becomes a permanent CloudWatch dimension, so keep IDs and personal data out of
 it. Set `max_job_classes` to `0` to publish the queue totals only.
 
 The throughput totals are published every minute, as `0` when nothing happened, so a
@@ -113,7 +115,8 @@ Per-class values are published only for classes that had activity.
 `FailedJobsTotal` is a backlog gauge and drops when someone runs `queue:retry`; alarm on
 `JobsFailed` instead. A failed job provider that cannot count (DynamoDB, the null provider,
 Laravel Cloud's managed queues) publishes no `FailedJobsTotal` rather than a zero that would
-keep an alarm green. The file provider keeps at most its `limit` (100 by default) on the host
+keep an alarm green. Sync, deferred and background connections store a failed job only when it
+ran inside a worker, so theirs stays at `0` for jobs run in a request. The file provider keeps at most its `limit` (100 by default) on the host
 that samples, so its gauge is capped and only sees that host's failures.
 
 What counts as what:
@@ -164,7 +167,7 @@ Logs, which extracts the metrics. A document, trimmed to one metric:
 
 Dimension values are transliterated to printable ASCII, which is all CloudWatch accepts. A
 value that had to change gets `#` and an 8-digit hash of the original appended, so two names
-never share a series: `Café` is published as `Cafe#9aef6e66`. Run
+practically never share a series: `Café` is published as `Cafe#9aef6e66`. Run
 `queue-monitor:sample --dry-run` to see the exact values before building alarms or dashboards
 on them.
 
@@ -177,7 +180,8 @@ adds up to 78 per queue. `max_job_classes` bounds it: the first classes seen on 
 their own dimension and every other class is folded into `__other__`, so the per-class values
 still add up to the queue total and the set of published series stays fixed from one hour to
 the next. `0` turns the breakdown off. To pick the classes again, change `counters.prefix`,
-which also drops the counts not yet published.
+which also drops the counts not yet published; the old keys have no expiry and stay until you
+delete them.
 
 Up to four times `max_job_classes` names per queue (100 by default) are counted at the usual
 cost and folded when sampled. A name seen after that is counted straight into `__other__`, so
@@ -232,15 +236,17 @@ failure is reported once per affected request. Throttle it with `$exceptions->th
 
 Keep the Redis `maxmemory-policy` off `allkeys-*`. Counters carry no TTL, so `volatile-*` and
 `noeviction` leave them alone, but `allkeys-*` can evict them and take a window of counts with
-it. Flushing the store loses the current window only, and counting resumes on its own, but
-`FLUSHDB` clears the whole database: never flush a store that shares one with your queues.
+it. Flushing the store loses the current window and the order the job classes were first seen
+in, so the classes keeping their own `JobClass` are picked again; counting resumes on its own.
+`FLUSHDB` clears the whole database, though: never flush a store that shares one with your
+queues.
 
 ## Sampling cost
 
 Each sample costs, per monitored queue, three depth reads from the driver, one or two
 failed-job counts (two when workers record the queue under another name: an SQS URL, `sync`,
 a forward target), one cache read for the job classes and one per 100 counters, one decrement
-per non-zero counter, and three round trips for the sampler lock.
+per non-zero counter, and three round trips for the sampler lock (four on DynamoDB).
 
 - **Database queue**: three `COUNT` queries on the `jobs` table. They do not block workers,
   but on a large backlog they are real work.

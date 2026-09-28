@@ -1,7 +1,7 @@
 # Sampling
 
-`queue-monitor:sample` runs once a minute on one server. Pair by pair, it reads the gauges, drains
-the counters and publishes one batch.
+`queue-monitor:sample` runs once a minute on one server. Pair by pair, it reads the gauges and the
+counters, publishes one batch, then subtracts what it published.
 
 ## The run
 
@@ -35,8 +35,9 @@ sequenceDiagram
   queue on the default connection) passed through `innerConnection()` like the config.
 - The lock lives in the counter store, so two runs never drain the same counters, even from servers
   that do not share the default cache. It lasts 300 s and is refreshed after collecting; a run that
-  outlived it may be racing a newer one, so it fails the pair rather than drain twice. A killed run
-  delays only the pair it held.
+  lost it may be racing a newer one, so it fails the pair rather than drain twice. The write and the
+  commit then have 300 s: nothing checks the lock after the refresh. A killed run delays only the
+  pair it held.
 - The sink returns before anything is subtracted. A sink that throws leaves the counters as they
   were, and the next run publishes them along with its own window: a failure re-publishes, never
   loses.
@@ -66,7 +67,8 @@ flowchart TD
 
 - **Failed jobs.** The queue is counted under its configured and its physical name, deduplicated:
   database and beanstalkd failures record the forward target, Redis ones the source name, SQS ones
-  the URL, sync ones `sync`. A provider that is not a `CountableFailedJobProvider`, is the
+  the URL, sync ones `sync`. Only `queue:work` stores failed jobs, so a sync-family job that fails in
+  a request never reaches this count. A provider that is not a `CountableFailedJobProvider`, is the
   `NullFailedJobProvider`, or serves Laravel Cloud's managed `cloud` connection publishes nothing
   rather than a zero that would keep an alarm green. Cloud wraps the application's provider and
   answers zero for one that cannot count, so the wrapped one, read by reflection, is judged instead.
@@ -103,8 +105,9 @@ flowchart LR
   `PIPE_BUF`; a short write throws.
 - `sanitise()` turns a blank value into `__unknown__`; otherwise it transliterates to ASCII, drops
   what is not printable and trims. A value that changed keeps at most 1015 characters plus `#` and
-  the `xxh32` of the original, so two names never share a series. Values are capped at CloudWatch's
-  1024.
+  the `xxh32` of the original, so names that clean to the same text stay apart. Values are capped at
+  CloudWatch's 1024; an unchanged one is cut without a hash, which job names, capped at 255 by the
+  listener, never need.
 - The constructor rejects a namespace CloudWatch would silently drop; `queue-monitor:status`
   surfaces it.
 
@@ -112,4 +115,6 @@ flowchart LR
 
 Resolves each monitored queue connection, `Counters` (which runs the store guard) and the sink
 (which validates the namespace), then prints the sink, the counter store, the `JobClass` setting and
-the pairs. Resolving opens no connection. Any failure prints its message and exits 1.
+the pairs. Resolving opens no connection. Any failure prints its message and exits 1. It builds
+neither the `Collector` nor the failed job provider, so a provider that cannot be built passes the
+check and fails every sample.
