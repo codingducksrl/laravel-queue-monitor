@@ -61,7 +61,7 @@ Queues are sampled one after another, so list slow ones last.
 
 Check the setup before traffic arrives. This builds the counter store, the sink and every
 monitored queue connection without connecting to them, and exits non-zero when one cannot be
-built, so it works as a deploy step:
+built, so it works as a deploy step. While monitoring is disabled it only warns.
 
 ```bash
 php artisan queue-monitor:status
@@ -75,10 +75,12 @@ increment a counter in a shared cache store. Nothing is buffered in PHP memory, 
 killed mid-job loses nothing but the job it was running.
 
 On the hot path that is one round trip per event (a single `INCRBY` on Redis) once the
-connection is open; under PHP-FPM the first event of each request also opens it (connect,
-`AUTH`, `SELECT`). A bulk dispatch or `Bus::batch()` of N jobs adds N round trips; see
-[Cost](#cost) for classes past the cap. Counting never throws into your code: a failure is reported to your exception handler
-and counting stands down for a minute in that process.
+connection is open, and two for a few events of each class after every sample
+([details](docs/counting.md#cost-per-event)); under PHP-FPM the first event of each request
+also opens the connection (connect, `AUTH`, `SELECT`). A bulk dispatch or `Bus::batch()` of N
+jobs adds N round trips; see [Cost](#cost) for classes past the cap. Counting never throws
+into your code: a failure is reported to your exception handler and counting stands down for a
+minute in that process.
 
 `queue-monitor:sample` then reads the gauges, drains the counters, and hands one batch per
 queue to the sink. It reads a counter, publishes it, and only then subtracts exactly what it
@@ -117,9 +119,10 @@ that samples, so its gauge is capped and only sees that host's failures.
 What counts as what:
 
 - A job that releases itself (`release()`, or `RateLimited` / `WithoutOverlapping` by default)
-  is not completed, and one that calls `fail()` is failed. Every other job counts as completed,
-  including one deleted without running: debounced, skipped by middleware (`Skip`, a cancelled
-  batch, `dontRelease()`) or dropped by `deleteWhenMissingModels`.
+  is not completed, and one that calls `fail()` is failed. An attempt that throws counts only
+  once the job fails for good. Every other job counts as completed, including one deleted
+  without running: debounced, skipped by middleware (`Skip`, a cancelled batch, `dontRelease()`)
+  or dropped by `deleteWhenMissingModels`.
 - A job retried with `queue:retry` completes without a matching `JobsQueued`.
 - A dispatch is counted when it is pushed, even inside a transaction that later rolls back. On
   Redis or SQS the job still runs; on a database queue sharing your connection the rollback
@@ -132,9 +135,10 @@ What counts as what:
   back to the configured name. List a forwarded queue under the name it is forwarded from: if
   only its target is listed, failed jobs stored by Redis workers under the source name are not
   counted.
-- Sync, deferred and background connections fire no `JobQueued`, and their jobs do not say which
-  queue they were pushed to, so they count towards the first queue listed for the connection. A
-  background connection is monitored as `sync`, which runs its jobs.
+- Sync, deferred and background connections fire no `JobQueued`, so they publish no
+  `JobsQueued`, and their jobs do not say which queue they were pushed to, so they count
+  towards the first queue listed for the connection. A background connection is monitored as
+  `sync`, which runs its jobs.
 - A failover connection is monitored as its first connection, the one it pushes to and pops
   from. Jobs that land on a later connection during a failover are not counted unless that
   connection is listed too.
@@ -149,18 +153,14 @@ want gauges during maintenance.
 
 ## CloudWatch EMF
 
-Nothing is sent to AWS from the package and no SDK is involved. The sink writes one JSON line
-per dimension tuple to stdout, and the platform's log driver — `awslogs` on ECS, fluent-bit on
-EKS, the Lambda runtime — carries it to CloudWatch Logs, which extracts the metrics. A document,
-trimmed to one metric:
+Nothing is sent to AWS from the package and no SDK is involved. Each sample writes JSON lines
+to stdout, one for a queue's totals and one per active job class, and the platform's log
+driver — `awslogs` on ECS, fluent-bit on EKS, the Lambda runtime — carries them to CloudWatch
+Logs, which extracts the metrics. A document, trimmed to one metric:
 
 ```json
 {"Connection":"redis","Queue":"default","JobsPending":42,"_aws":{"Timestamp":1789981200000,"CloudWatchMetrics":[{"Namespace":"Laravel/Queue","Dimensions":[["Connection","Queue"]],"Metrics":[{"Name":"JobsPending","Unit":"Count"}]}]}}
 ```
-
-Each document carries exactly one dimension set. Listing both the queue-level and per-class
-sets in one document would publish the queue-level value once per job class, and its `Sum`
-would come out multiplied by the class count.
 
 Dimension values are transliterated to printable ASCII, which is all CloudWatch accepts. A
 value that had to change gets `#` and an 8-digit hash of the original appended, so two names
@@ -173,29 +173,27 @@ on them.
 CloudWatch bills per custom metric, prorated by the hour, and a custom metric is one metric
 name paired with one dimension tuple. The queue-level metrics are up to seven per queue; the
 per-class breakdown adds three per class, plus three for `__other__`, so the default cap of 25
-adds up to 78 per queue. `max_job_classes` bounds it:
-the first classes seen on a queue keep their own dimension and every other class is folded
-into `__other__`, so the per-class values still add up to the queue total and the set of
-published series stays fixed from one hour to the next. `0` turns the breakdown off. To pick
-the classes again, change `counters.prefix`.
+adds up to 78 per queue. `max_job_classes` bounds it: the first classes seen on a queue keep
+their own dimension and every other class is folded into `__other__`, so the per-class values
+still add up to the queue total and the set of published series stays fixed from one hour to
+the next. `0` turns the breakdown off. To pick the classes again, change `counters.prefix`,
+which also drops the counts not yet published.
 
-The registry behind this tracks four times `max_job_classes` per queue (100 by default), so a
-class past the cap still costs one round trip per event. A class seen after that is counted
-straight into `__other__`, so runaway names (a `displayName()` with an ID in it) cannot grow
-the registry or the sampler's reads. They are not free, though: the first event of each such
-name costs about five round trips, later events of a repeating one cost two, and each leaves a
-parked key that lives for two minutes.
+Up to four times `max_job_classes` names per queue (100 by default) are counted at the usual
+cost and folded when sampled. A name seen after that is counted straight into `__other__`, so
+runaway names (a `displayName()` with an ID in it) cannot grow what the sampler reads. They
+are not free, though: the first event of each such name costs about five round trips, later
+events of a repeating one cost two, and each leaves a key that lives for two minutes.
 
 ## Counter store
 
 Point `counters.store` at a Redis store. DynamoDB also works, but costs an HTTPS round trip per
 job event, holds one item per class and metric (which caps a single class, or a whole queue
 with `max_job_classes` at `0`, at DynamoDB's per-item write rate), and reads eventually
-consistently: a class registered by two processes
-at once can be missed, and a released sampler lock can linger until it expires. On any store,
-a class whose registration is missed that way, or because the registry lock was busy, is
-counted but not published until a re-check finds it, at its 2nd, 4th, 8th … 64th event and
-every 100th after that.
+consistently: a class registered by two processes at once can be missed, and a released
+sampler lock can linger until it expires. On any store, a class whose registration is missed
+that way, or because the registry lock was busy, keeps counting and is published once one of
+its next events registers it again, at most 100 events later.
 
 Every other store is refused, and so is a Redis store whose connection or `lock_connection` is
 not defined or is also used by a Redis queue: bulk dispatch pushes inside a `MULTI` on that
@@ -254,7 +252,7 @@ per non-zero counter, and three round trips for the sampler lock.
 
 ## Another monitoring system
 
-Implement `MetricSink` and register it:
+Implement `MetricSink` and register it, typically in a service provider's `boot()`:
 
 ```php
 use CodingDuck\QueueMonitor\MetricSinkManager;
@@ -264,8 +262,12 @@ $this->app->make(MetricSinkManager::class)->extend('datadog', function ($app) {
 });
 ```
 
-Then set `QUEUE_MONITOR_SINK=datadog`. A `Metric` carries a name, an integer count and a flat
-dimension map.
+Then set `QUEUE_MONITOR_SINK=datadog`. Each `write()` call receives one queue's batch. A
+`Metric` carries a name, an integer count and a flat dimension map (`Connection`, `Queue`, and
+`JobClass` on the per-class values), not cleaned for any backend. Throw when delivery fails:
+the counters are drained as soon as `write()` returns, so a sink that swallows an error loses
+that window. `--dry-run` prints dimension values cleaned the way the EMF sink cleans them,
+whatever the sink.
 
 ## Commands
 
@@ -287,31 +289,18 @@ outside it publishes depth but no throughput.
 | Key | Env | Default | Meaning |
 |---|---|---|---|
 | `enabled` | `QUEUE_MONITOR_ENABLED` | `false` | Master switch. When off, no listeners are registered at all. |
-| `queues` | | `[]` | Connection to queue map that is counted and sampled. Empty means the default connection's default queue. |
+| `queues` | | `[]` | Connection to queue map that is counted and sampled. A connection listed without queues monitors its default queue; an empty map, the default connection's default queue. |
 | `sink` | `QUEUE_MONITOR_SINK` | `emf` | `emf` or a driver you registered. |
 | `emf.namespace` | `QUEUE_MONITOR_NAMESPACE` | `Laravel/Queue` | CloudWatch namespace: up to 255 of `A-Z a-z 0-9 . - _ / # :` and space, not starting with `:`, a space or `AWS/`. |
-| `emf.entity` | `QUEUE_MONITOR_SERVICE`, `QUEUE_MONITOR_ENVIRONMENT` | `[]` | `Service` and `Environment` root fields. |
+| `emf.entity` | `QUEUE_MONITOR_SERVICE`, `QUEUE_MONITOR_ENVIRONMENT` | `[]` | `Service` and `Environment` fields added to every document, not as dimensions. |
 | `counters.store` | `QUEUE_MONITOR_CACHE_STORE` | `null` | Cache store for counters. Null uses the default. |
 | `counters.prefix` | `QUEUE_MONITOR_CACHE_PREFIX` | `queue-monitor` | Cache key prefix. |
 | `max_job_classes` | `QUEUE_MONITOR_MAX_JOB_CLASSES` | `25` | Classes keeping their own `JobClass` dimension before folding; `0` publishes queue totals only. |
 
-## Development
+## Contributing
 
-```bash
-composer test          # analyse + lint:check + type coverage + unit
-composer analyse       # PHPStan / Larastan, level 10
-composer lint          # Pint, fix in place
-composer test:unit     # Pest
-```
-
-The Redis tests run against a real server and are skipped unless the `redis` extension is
-loaded and `REDIS_HOST` points at one; CI provides both, and so does the Sail environment:
-
-```bash
-docker network create proxy
-./vendor/bin/sail up -d
-./vendor/bin/sail composer test
-```
+How the package works inside, how to run its checks and what the tests hold it to:
+[docs/](docs/README.md).
 
 ## License
 
