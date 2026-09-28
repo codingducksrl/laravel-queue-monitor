@@ -13,7 +13,7 @@ use Illuminate\Queue\SqsQueue;
 use Illuminate\Queue\SyncQueue;
 use InvalidArgumentException;
 
-class QueueMonitor {
+final class QueueMonitor {
     /** @var list<array{0: string, 1: string}>|null */
     private ?array $pairs = null;
 
@@ -25,9 +25,6 @@ class QueueMonitor {
         private readonly Container $app,
     ) {}
 
-    /**
-     * Whether monitoring is switched on at all.
-     */
     public function enabled(): bool {
         return filter_var($this->config->get('queue-monitor.enabled'), FILTER_VALIDATE_BOOL);
     }
@@ -55,8 +52,8 @@ class QueueMonitor {
     }
 
     /**
-     * The name a worker reports a monitored queue under, which is also what
-     * the failed job store records.
+     * The name the driver resolves a queue to: an SQS URL, "sync" on a
+     * sync-family connection, otherwise the forward target.
      */
     public function physicalQueue(string $connection, string $queue): string {
         $driver = $this->app->make(Factory::class)->connection($connection);
@@ -79,6 +76,20 @@ class QueueMonitor {
         return is_string($url) ? $url : $this->forwarded($connection, $queue);
     }
 
+    /**
+     * Jobs report the connection that runs them: a failover connection's
+     * first one, and "sync" for a background connection.
+     */
+    public function innerConnection(string $connection): string {
+        $first = $this->config->get("queue.connections.{$connection}.connections.0");
+
+        return match ($this->config->get("queue.connections.{$connection}.driver")) {
+            'failover' => is_string($first) && $first !== '' ? $first : $connection,
+            'background' => 'sync',
+            default => $connection,
+        };
+    }
+
     public function defaultConnection(): string {
         $connection = $this->config->get('queue.default');
 
@@ -89,12 +100,6 @@ class QueueMonitor {
         $queue = $this->config->get("queue.connections.{$connection}.queue");
 
         return is_string($queue) && $queue !== '' ? $queue : 'default';
-    }
-
-    public function sink(): string {
-        $sink = $this->config->get('queue-monitor.sink');
-
-        return is_string($sink) && $sink !== '' ? $sink : 'null';
     }
 
     public function counterStore(): ?string {
@@ -110,9 +115,9 @@ class QueueMonitor {
     }
 
     public function maxJobClasses(): int {
-        $max = $this->config->get('queue-monitor.max_job_classes');
+        $max = filter_var($this->config->get('queue-monitor.max_job_classes') ?? 25, FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]);
 
-        return is_int($max) && $max > 0 ? $max : 25;
+        return $max !== false ? $max : throw new InvalidArgumentException('queue-monitor.max_job_classes must be 0 or a positive integer.');
     }
 
     /**
@@ -148,33 +153,22 @@ class QueueMonitor {
     }
 
     /**
+     * A monitored queue's own name always wins over another queue's alias.
+     *
      * @return array<string, string>
      */
     private function aliasesFor(string $connection): array {
         $aliases = [];
 
         foreach ($this->sampledQueues() as [$monitored, $queue]) {
-            if ($monitored !== $connection) {
-                continue;
+            if ($monitored === $connection) {
+                $aliases[$queue] = $queue;
+                $aliases[$this->forwarded($connection, $queue)] ??= $queue;
+                $aliases[$this->physicalQueue($connection, $queue)] ??= $queue;
             }
-
-            $aliases[$this->forwarded($connection, $queue)] = $queue;
-            $aliases[$this->physicalQueue($connection, $queue)] = $queue;
         }
 
         return $aliases;
-    }
-
-    /**
-     * A failover connection pushes and pops through its first connection, and
-     * jobs report that one, so it is monitored under that name.
-     */
-    public function innerConnection(string $connection): string {
-        $inner = $this->config->get("queue.connections.{$connection}.connections.0");
-
-        return $this->config->get("queue.connections.{$connection}.driver") === 'failover' && is_string($inner) && $inner !== ''
-            ? $inner
-            : $connection;
     }
 
     private function forwarded(string $connection, string $queue): string {

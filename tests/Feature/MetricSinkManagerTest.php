@@ -5,28 +5,21 @@ declare(strict_types=1);
 use CodingDuck\QueueMonitor\Metric;
 use CodingDuck\QueueMonitor\MetricSink;
 use CodingDuck\QueueMonitor\MetricSinkManager;
-use CodingDuck\QueueMonitor\Sinks\Emf\EmfSink;
-use CodingDuck\QueueMonitor\Sinks\NullSink;
+use CodingDuck\QueueMonitor\Sinks\EmfSink;
 
-it('resolves the configured sink', function (string $driver, string $expected): void {
+it('defaults to the EMF sink', function (?string $driver): void {
     config()->set('queue-monitor.sink', $driver);
 
-    expect(app(MetricSinkManager::class)->sink())->toBeInstanceOf($expected);
-})->with([
-    'emf' => ['emf', EmfSink::class],
-    'null' => ['null', NullSink::class],
-]);
+    expect(app(MetricSinkManager::class)->sink())->toBeInstanceOf(EmfSink::class);
+})->with(['emf', '', null]);
 
-it('falls back to the null sink when none is configured', function (): void {
-    config()->set('queue-monitor.sink', '');
+it('builds the EMF sink from the config', function (): void {
+    config()->set('queue-monitor.emf.namespace', 'Acme/Queues');
+    config()->set('queue-monitor.emf.entity', ['Service' => 'checkout', 'Environment' => null, 7 => 'x']);
 
-    expect(app(MetricSinkManager::class)->sink())->toBeInstanceOf(NullSink::class);
-});
+    $sink = app(MetricSinkManager::class)->sink('emf');
 
-it('memoises the resolved sink', function (): void {
-    $manager = app(MetricSinkManager::class);
-
-    expect($manager->sink())->toBe($manager->sink());
+    expect((fn (): array => [$this->namespace, $this->entity])->call($sink))->toBe(['Acme/Queues', ['Service' => 'checkout']]);
 });
 
 it('accepts a sink registered by the application', function (): void {

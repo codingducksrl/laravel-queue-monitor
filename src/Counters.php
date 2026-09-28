@@ -4,19 +4,16 @@ declare(strict_types=1);
 
 namespace CodingDuck\QueueMonitor;
 
+use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\Repository;
-use Illuminate\Support\Sleep;
 use RuntimeException;
 
-/**
- * Throughput counters in a shared cache store. Increments happen as the event
- * fires, so nothing accumulates in process memory, and the steady state costs
- * one round trip per event (two for a class past the registry cap).
- */
 final readonly class Counters {
+    public const string OTHER = '__other__';
+
     /**
-     * Stores that need a seed expire it; five years is what DynamoDB calls forever.
+     * Repository::add() is only atomic with a TTL, so a seed gets one that never matters.
      */
     private const int TTL = 157_680_000;
 
@@ -30,36 +27,31 @@ final readonly class Counters {
     /**
      * A class that cannot fit in a full registry has its key parked this far
      * up, so every later increment reads as parked and goes straight to the
-     * overflow bucket. Up rather than down, because memcached cannot hold a
-     * negative value.
+     * overflow bucket.
      */
     private const int PARKED = 1_000_000_000_000_000;
 
     /**
-     * A parked key expires, so runaway names do not pile up for long; once
-     * gone, a class that is still busy simply parks again.
+     * A parked key expires, so runaway names do not pile up.
      */
-    private const int PARKED_TTL = 3_600;
-
-    /**
-     * Names are stored in the registry the sampler reads, so they are capped.
-     */
-    public static function label(mixed $name): string {
-        return is_string($name) && $name !== '' ? mb_substr($name, 0, 255) : 'unknown';
-    }
+    private const int PARKED_TTL = 120;
 
     public function __construct(
         private Repository $cache,
-        private string $prefix = 'queue-monitor',
+        private string $prefix,
         private int $maxClasses = 100,
     ) {}
 
     public function increment(string $connection, string $queue, string $metric, string $class): void {
+        // Without a JobClass dimension only the totals are needed.
+        if ($this->maxClasses === 0) {
+            $class = self::OTHER;
+        }
+
         $key = $this->key($connection, $queue, $metric, $class);
         $value = $this->bump($key, 1);
 
-        // Only a parked key expires within years, and DynamoDB refuses both
-        // the increment and the seed during its expiry second.
+        // Null only while a parked key sits in its DynamoDB expiry second.
         if ($value === null || $value >= self::PARKED) {
             $this->overflow($connection, $queue, $metric, 1);
 
@@ -78,27 +70,22 @@ final readonly class Counters {
         $this->cache->touch($key, self::PARKED_TTL);
         $moved = ($this->bump($key, self::PARKED) ?? throw self::rejected()) - self::PARKED;
 
-        if ($moved >= self::PARKED) {
-            // Another process parked it first and has already moved these.
-            $this->cache->decrement($key, self::PARKED);
-
-            return;
+        // Past PARKED, another process parked it first and moved these already.
+        if ($moved > 0 && $moved < self::PARKED) {
+            $this->overflow($connection, $queue, $metric, $moved);
         }
-
-        $this->overflow($connection, $queue, $metric, $moved);
     }
 
     /**
-     * @param list<string>      $metrics
      * @param list<string>|null $classes the registry, when the caller already read it
      *
      * @return array<string, array<string, int>> metric => job class => count
      */
-    public function read(string $connection, string $queue, array $metrics, ?array $classes = null): array {
+    public function read(string $connection, string $queue, ?array $classes = null): array {
         $keys = [];
 
         foreach ($classes ?? $this->classes($connection, $queue) as $class) {
-            foreach ($metrics as $metric) {
+            foreach (MetricName::COUNTERS as $metric) {
                 $keys[$this->key($connection, $queue, $metric, $class)] = [$metric, $class];
             }
         }
@@ -145,15 +132,21 @@ final readonly class Counters {
      */
     public function classes(string $connection, string $queue): array {
         /** @var mixed $stored */
-        $stored = $this->cache->get($this->registryKey($connection, $queue));
+        $stored = $this->cache->get($this->queueKey('c', $connection, $queue));
 
         return is_array($stored) ? array_values(array_filter($stored, is_string(...))) : [];
     }
 
     /**
+     * The lock that keeps two samplers from draining the same counters.
+     */
+    public function lock(string $connection, string $queue, int $seconds): Lock {
+        return $this->newLock($this->queueKey('sample', $connection, $queue), $seconds);
+    }
+
+    /**
      * Increment, seeding the key on stores that refuse to increment one that
-     * does not exist. Redis creates it, so it never reaches the seed. Null
-     * when the store refuses both.
+     * does not exist. Null when the store refuses both.
      */
     private function bump(string $key, int $by): ?int {
         $value = $this->cache->increment($key, $by);
@@ -170,10 +163,10 @@ final readonly class Counters {
     }
 
     private function overflow(string $connection, string $queue, string $metric, int $by): void {
-        $value = $this->bump($this->key($connection, $queue, $metric, Collector::OTHER), $by) ?? throw self::rejected();
+        $value = $this->bump($this->key($connection, $queue, $metric, self::OTHER), $by) ?? throw self::rejected();
 
         if (self::crossed($value, $by)) {
-            $this->register($connection, $queue, Collector::OTHER);
+            $this->register($connection, $queue, self::OTHER);
         }
     }
 
@@ -197,27 +190,16 @@ final readonly class Counters {
             return true;
         }
 
-        if ($class !== Collector::OTHER && count($classes) >= $this->maxClasses) {
+        if ($class !== self::OTHER && count($classes) >= $this->maxClasses) {
             return false;
         }
 
-        $store = $this->cache->getStore();
+        $key = $this->queueKey('c', $connection, $queue);
+        $lock = $this->newLock($key.':lock', 5);
 
-        if (! $store instanceof LockProvider) {
-            throw new RuntimeException('The queue-monitor counter store must support locks.');
-        }
-
-        $key = $this->registryKey($connection, $queue);
-        $lock = $store->lock($key.':lock', 5);
-
-        // The critical section is two round trips, so the wait is short. Past
-        // it, the count stays where it is and the next recheck registers it.
-        for ($attempt = 1; ! $lock->get(); $attempt++) {
-            if ($attempt === 5) {
-                return true;
-            }
-
-            Sleep::usleep(10_000);
+        // Past a busy lock the count stays where it is and the next recheck registers it.
+        if (! $lock->get()) {
+            return true;
         }
 
         try {
@@ -227,7 +209,7 @@ final readonly class Counters {
                 return true;
             }
 
-            if ($class !== Collector::OTHER && count($classes) >= $this->maxClasses) {
+            if ($class !== self::OTHER && count($classes) >= $this->maxClasses) {
                 return false;
             }
 
@@ -239,11 +221,18 @@ final readonly class Counters {
         }
     }
 
+    private function newLock(string $name, int $seconds): Lock {
+        $store = $this->cache->getStore();
+        $lock = $store instanceof LockProvider ? $store->lock($name, $seconds) : null;
+
+        return $lock instanceof Lock ? $lock : throw new RuntimeException('The queue-monitor counter store must support locks.');
+    }
+
     private function key(string $connection, string $queue, string $metric, string $class): string {
         return $this->prefix.':v:'.hash('xxh128', implode("\0", [$connection, $queue, $metric, $class]));
     }
 
-    private function registryKey(string $connection, string $queue): string {
-        return $this->prefix.':c:'.hash('xxh128', $connection."\0".$queue);
+    private function queueKey(string $kind, string $connection, string $queue): string {
+        return $this->prefix.':'.$kind.':'.hash('xxh128', $connection."\0".$queue);
     }
 }

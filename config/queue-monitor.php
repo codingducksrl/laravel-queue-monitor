@@ -9,8 +9,8 @@ return [
     |--------------------------------------------------------------------------
     |
     | Off until you turn it on, so installing the package costs nothing before
-    | a sink and a counter store are chosen. When false no queue events are
-    | observed and nothing is recorded.
+    | a counter store is chosen. When false no queue events are observed and
+    | nothing is recorded.
     |
     */
 
@@ -25,7 +25,8 @@ return [
     | counted only for these pairs, because a counter nobody samples would cost
     | a cache write per job and never be published. An empty map monitors the
     | default queue of the default connection. A failover connection is
-    | monitored as its first connection, the one it pushes to and pops from.
+    | monitored as its first connection, the one it pushes to and pops from,
+    | and a background connection as sync, which runs its jobs.
     |
     |     'queues' => ['redis' => ['default', 'high']],
     |
@@ -38,37 +39,30 @@ return [
     | Metric sink
     |--------------------------------------------------------------------------
     |
-    | Where samples are delivered: 'emf', 'null', or any driver registered with
+    | Where samples are delivered: 'emf', or any driver registered with
     | MetricSinkManager::extend().
     |
     */
 
-    'sink' => env('QUEUE_MONITOR_SINK', 'null'),
+    'sink' => env('QUEUE_MONITOR_SINK', 'emf'),
 
     /*
     |--------------------------------------------------------------------------
     | CloudWatch Embedded Metric Format
     |--------------------------------------------------------------------------
     |
-    | Writes one JSON line per dimension tuple. Nothing is sent to AWS from here
-    | and no SDK is involved: the platform's log driver ships the line to
-    | CloudWatch Logs, which extracts the metrics.
+    | Writes one JSON line per dimension tuple to stdout. Nothing is sent to
+    | AWS from here and no SDK is involved: the platform's log driver ships the
+    | line to CloudWatch Logs, which extracts the metrics.
     |
-    | Leaving `channel` null writes to php://stdout. The scheduler sends a
-    | command's output to /dev/null unless told otherwise, so schedule the
-    | sampler with ->appendOutputTo(...); the sampler refuses to drain the
-    | counters into /dev/null.
-    |
-    | Setting `channel` routes through a Laravel log channel, which MUST emit
-    | the raw message at the info level: the default formatter's prefix makes
-    | the line unparseable and the metrics silently disappear.
+    | The scheduler sends a command's output to /dev/null unless told
+    | otherwise, so schedule the sampler with ->appendOutputTo(...); the
+    | sampler refuses to drain the counters into /dev/null.
     |
     */
 
     'emf' => [
         'namespace' => env('QUEUE_MONITOR_NAMESPACE', 'Laravel/Queue'),
-
-        'channel' => env('QUEUE_MONITOR_EMF_CHANNEL'),
 
         'entity' => array_filter([
             'Service' => env('QUEUE_MONITOR_SERVICE'),
@@ -85,10 +79,9 @@ return [
     | store, so nothing accumulates in PHP memory and a worker killed mid-job
     | loses nothing but the job it was running.
     |
-    | Use a redis store. Memcached and DynamoDB also work; a database store is
-    | refused on the default connection. Give it a connection name nothing else
-    | uses, or counting joins the application's transactions. Anything that
-    | cannot increment atomically across processes is refused when first used.
+    | Use a redis store with a connection of its own: neither its connection
+    | nor its lock_connection may be one a Redis queue uses. DynamoDB also
+    | works. Any other store is refused when first used.
     |
     */
 
@@ -100,14 +93,17 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Job class cardinality
+    | Job class dimension
     |--------------------------------------------------------------------------
     |
-    | The first job classes seen on a queue keep their own JobClass dimension;
-    | the rest are folded into a single bucket so the per-class values still
-    | add up to the queue total and the set of published metrics stays fixed.
+    | JobsQueued, JobsCompleted and JobsFailed are also published per job
+    | class. The first classes seen on a queue keep their own JobClass
+    | dimension; the rest are folded into a single bucket, so the per-class
+    | values still add up to the queue total and the set of published metrics
+    | stays fixed. Every class adds CloudWatch custom metrics; 0 publishes
+    | the queue totals only.
     |
     */
 
-    'max_job_classes' => 25,
+    'max_job_classes' => env('QUEUE_MONITOR_MAX_JOB_CLASSES', 25),
 ];

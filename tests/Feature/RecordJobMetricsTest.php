@@ -31,7 +31,7 @@ afterEach(function (): void {
 });
 
 function readCounters(string $connection = 'database', string $queue = 'default'): array {
-    return app(Counters::class)->read($connection, $queue, MetricName::counters());
+    return app(Counters::class)->read($connection, $queue);
 }
 
 function fakeJob(
@@ -44,7 +44,7 @@ function fakeJob(
     $job = Mockery::mock(Job::class);
     $job->shouldReceive('getQueue')->andReturn($queue);
     $job->shouldReceive('getConnectionName')->andReturn($connection);
-    $job->shouldReceive('resolveName')->andReturn($name);
+    $job->shouldReceive('payload')->andReturn(['displayName' => $name, 'job' => 'Illuminate\Queue\CallQueuedHandler@call']);
     $job->shouldReceive('isReleased')->andReturn($released);
     $job->shouldReceive('hasFailed')->andReturn($failed);
 
@@ -165,15 +165,13 @@ it('names a queued closure the way the worker does', function (): void {
         ->and(array_key_first($counters[MetricName::JobsQueued]))->toStartWith('Closure (');
 });
 
-it('counts a job whose payload cannot be read under unknown without standing down', function (): void {
+it('counts a job whose payload cannot be read under unknown without standing down', function (mixed $payload): void {
     Exceptions::fake();
 
-    $job = fakeJob();
-    $job->shouldReceive('resolveName')->andThrow(new ErrorException('Undefined array key "job"'));
     $poison = Mockery::mock(Job::class);
     $poison->shouldReceive('getQueue')->andReturn('default');
     $poison->shouldReceive('getConnectionName')->andReturn('database');
-    $poison->shouldReceive('resolveName')->andThrow(new ErrorException('Undefined array key "job"'));
+    $poison->shouldReceive('payload')->andReturn($payload);
 
     event(new JobFailed('database', $poison, new RuntimeException('bad payload')));
     event(new JobProcessed('database', fakeJob()));
@@ -183,7 +181,7 @@ it('counts a job whose payload cannot be read under unknown without standing dow
         MetricName::JobsCompleted => ['Workbench\App\Jobs\SendInvoice' => 1],
     ]);
     Exceptions::assertNothingReported();
-});
+})->with(['undecodable' => [null], 'not an object' => ['job'], 'nameless' => [['uuid' => 'u']]]);
 
 it('caps the length of a job name', function (): void {
     event(new JobProcessed('database', fakeJob(str_repeat('n', 1000))));
@@ -239,6 +237,39 @@ it('counts a forwarded queue under the name it is monitored by', function (): vo
     ]);
 });
 
+it('counts a job under the queue it landed on when the queue forwarded to it is monitored too', function (array $queues): void {
+    config()->set('queue-monitor.queues', ['database' => $queues]);
+    app('queue.routes')->forward('default', 'overflow');
+
+    event(queued('overflow'));
+    event(queued('default'));
+
+    expect(readCounters(queue: 'overflow'))->toBe([MetricName::JobsQueued => ['Workbench\App\Jobs\SendInvoice' => 2]])
+        ->and(readCounters())->toBe([]);
+})->with([[['overflow', 'default']], [['default', 'overflow']]]);
+
+it('counts every class as one when the class dimension is off', function (): void {
+    config()->set('queue-monitor.max_job_classes', 0);
+    app()->forgetInstance(Counters::class);
+
+    event(queued());
+    event(new JobProcessed('database', fakeJob('App\Jobs\Other')));
+
+    expect(readCounters())->toBe([
+        MetricName::JobsQueued => [Counters::OTHER => 1],
+        MetricName::JobsCompleted => [Counters::OTHER => 1],
+    ]);
+});
+
+it('counts a background connection under sync, which runs its jobs', function (): void {
+    config()->set('queue.connections.background', ['driver' => 'background']);
+    config()->set('queue-monitor.queues', ['background' => ['default']]);
+
+    event(new JobProcessed('sync', fakeJob(queue: 'sync', connection: 'sync')));
+
+    expect(readCounters('sync')[MetricName::JobsCompleted])->toBe(['Workbench\App\Jobs\SendInvoice' => 1]);
+});
+
 it('never lets a broken counter store reach the job', function (): void {
     Exceptions::fake();
 
@@ -251,6 +282,15 @@ it('never lets a broken counter store reach the job', function (): void {
     event(new JobProcessed('database', fakeJob()));
 
     Exceptions::assertReported(fn (RuntimeException $e): bool => $e->getMessage() === 'cache is down');
+});
+
+it('keeps dispatch working when reporting the failure throws too', function (): void {
+    Exceptions::reportable(fn (Throwable $e): never => throw new RuntimeException('reporter is down'));
+    breakCounterStore('does-not-exist');
+
+    SendInvoice::dispatch()->onConnection('database');
+
+    expect(DB::table('jobs')->count())->toBe(1);
 });
 
 it('keeps dispatch working when the counter store is rejected or undefined', function (string $store): void {

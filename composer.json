@@ -22,7 +22,6 @@
         "illuminate/cache": "^13.26",
         "illuminate/console": "^13.26",
         "illuminate/contracts": "^13.26",
-        "illuminate/log": "^13.26",
         "illuminate/queue": "^13.26",
         "illuminate/support": "^13.26"
     },
@@ -94,10 +93,7 @@
         "laravel": {
             "providers": [
                 "CodingDuck\\QueueMonitor\\QueueMonitorServiceProvider"
-            ],
-            "aliases": {
-                "QueueMonitor": "CodingDuck\\QueueMonitor\\Facades\\QueueMonitor"
-            }
+            ]
         }
     },
     "config": {

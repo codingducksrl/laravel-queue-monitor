@@ -5,22 +5,13 @@ declare(strict_types=1);
 use CodingDuck\QueueMonitor\Counters;
 use CodingDuck\QueueMonitor\MetricName;
 use CodingDuck\QueueMonitor\MetricSink;
-use CodingDuck\QueueMonitor\MetricSinkManager;
-use CodingDuck\QueueMonitor\Sinks\Emf\Emitter;
-use CodingDuck\QueueMonitor\Sinks\Emf\StdoutEmitter;
+use CodingDuck\QueueMonitor\Sinks\EmfSink;
 use Illuminate\Support\Facades\Queue;
 use Workbench\App\Jobs\SendInvoice;
 
 it('publishes valid EMF documents for a real queue', function (): void {
-    config()->set('queue-monitor.sink', 'emf');
-    config()->set('queue-monitor.emf.namespace', 'Acme/Queues');
-    config()->set('queue-monitor.emf.entity', ['Service' => 'checkout', 'Environment' => 'testing']);
-    config()->set('queue-monitor.queues', ['database' => ['default']]);
-
-    $stream = new SplFileObject('php://memory', 'r+');
-    app()->bind(Emitter::class, fn (): Emitter => new StdoutEmitter($stream));
-    app()->forgetInstance(MetricSink::class);
-    app()->instance(MetricSink::class, app(MetricSinkManager::class)->sink('emf'));
+    $stream = new SplFileObject('php://memory', 'w+');
+    app()->instance(MetricSink::class, new EmfSink('Acme/Queues', ['Service' => 'checkout', 'Environment' => 'testing'], $stream));
 
     Queue::connection('database')->push(new SendInvoice);
     app(Counters::class)->increment('database', 'default', MetricName::JobsCompleted, SendInvoice::class);
@@ -73,7 +64,8 @@ function assertValidEmf(array $document): void {
         expect($directive)->toHaveKeys(['Namespace', 'Dimensions', 'Metrics'])
             ->and($directive['Namespace'])->toBeString()->not->toBeEmpty()
             ->and($directive['Dimensions'])->not->toBeEmpty()
-            ->and(count($directive['Metrics']))->toBeLessThanOrEqual(100);
+            ->and(count($directive['Metrics']))->toBeLessThanOrEqual(100)
+            ->and(array_unique(array_column($directive['Metrics'], 'Name')))->toHaveCount(count($directive['Metrics']));
 
         foreach ($directive['Dimensions'] as $set) {
             expect(count($set))->toBeLessThanOrEqual(30);
@@ -88,13 +80,7 @@ function assertValidEmf(array $document): void {
         foreach ($directive['Metrics'] as $metric) {
             expect($metric)->toHaveKey('Name')
                 ->and($document[$metric['Name']] ?? null)->toBeNumeric()
-                ->and($metric['Unit'])->toBeIn([
-                    'Seconds', 'Microseconds', 'Milliseconds', 'Bytes', 'Kilobytes', 'Megabytes',
-                    'Gigabytes', 'Terabytes', 'Bits', 'Kilobits', 'Megabits', 'Gigabits', 'Terabits',
-                    'Percent', 'Count', 'Bytes/Second', 'Kilobytes/Second', 'Megabytes/Second',
-                    'Gigabytes/Second', 'Terabytes/Second', 'Bits/Second', 'Kilobits/Second',
-                    'Megabits/Second', 'Gigabits/Second', 'Terabits/Second', 'Count/Second', 'None',
-                ]);
+                ->and($metric['Unit'])->toBe('Count');
         }
     }
 }

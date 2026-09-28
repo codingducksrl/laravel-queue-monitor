@@ -13,7 +13,7 @@ use Illuminate\Support\Facades\Cache;
  */
 function redisCounters(array $options = []): Counters {
     config()->set('database.redis.qm', [
-        'host' => getenv('REDIS_HOST') ?: '127.0.0.1',
+        'host' => getenv('REDIS_HOST'),
         'port' => (int) (getenv('REDIS_PORT') ?: 6379),
         'database' => 15,
         'options' => $options,
@@ -30,8 +30,8 @@ function redisCounters(array $options = []): Counters {
 }
 
 beforeEach(function (): void {
-    if (! extension_loaded('redis') && ! getenv('CI')) {
-        $this->markTestSkipped('The redis extension is not installed.');
+    if (! getenv('CI') && (! extension_loaded('redis') || ! getenv('REDIS_HOST'))) {
+        $this->markTestSkipped('Needs the redis extension and REDIS_HOST.');
     }
 });
 
@@ -42,13 +42,13 @@ it('counts, registers and drains on redis', function (array $options): void {
         $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
     }
 
-    $readings = $counters->read('redis', 'default', MetricName::counters());
+    $readings = $counters->read('redis', 'default');
     $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
     $counters->commit('redis', 'default', $readings);
 
     expect($readings)->toBe([MetricName::JobsCompleted => ['App\Jobs\A' => 3]])
         ->and($counters->classes('redis', 'default'))->toBe(['App\Jobs\A'])
-        ->and($counters->read('redis', 'default', MetricName::counters()))
+        ->and($counters->read('redis', 'default'))
         ->toBe([MetricName::JobsCompleted => ['App\Jobs\A' => 1]]);
 })->with(function (): array {
     // Serialized or compressed values used to poison the seed, so INCRBY failed forever.

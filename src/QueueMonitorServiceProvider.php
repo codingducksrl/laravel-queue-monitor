@@ -4,21 +4,16 @@ declare(strict_types=1);
 
 namespace CodingDuck\QueueMonitor;
 
-use CodingDuck\QueueMonitor\Console\Commands\QueueMonitorCommand;
 use CodingDuck\QueueMonitor\Console\Commands\SampleCommand;
-use Illuminate\Cache\DatabaseStore;
+use CodingDuck\QueueMonitor\Console\Commands\StatusCommand;
+use Illuminate\Cache\CacheManager;
 use Illuminate\Cache\DynamoDbStore;
-use Illuminate\Cache\MemcachedStore;
 use Illuminate\Cache\RedisStore;
 use Illuminate\Cache\Repository as CacheRepository;
-use Illuminate\Contracts\Cache\Factory as CacheFactory;
 use Illuminate\Contracts\Cache\Store;
 use Illuminate\Contracts\Config\Repository;
-use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Foundation\Application;
-use Illuminate\Contracts\Queue\Factory as QueueFactory;
-use Illuminate\Database\DatabaseManager;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobQueued;
@@ -26,118 +21,87 @@ use Illuminate\Support\ServiceProvider;
 use RuntimeException;
 
 class QueueMonitorServiceProvider extends ServiceProvider {
-    /**
-     * Register any package services.
-     */
     public function register(): void {
         $this->mergeConfigFrom(__DIR__.'/../config/queue-monitor.php', 'queue-monitor');
 
-        $this->app->singleton(
-            QueueMonitor::class, function (Application $app): QueueMonitor {
-                return new QueueMonitor($app->make(Repository::class), $app);
-            }
-        );
-
-        $this->app->singleton(
-            MetricSinkManager::class, function (Application $app): MetricSinkManager {
-                return new MetricSinkManager($app);
-            }
-        );
-
-        $this->app->singleton(
-            MetricSink::class, function (Application $app): MetricSink {
-                return $app->make(MetricSinkManager::class)->sink();
-            }
-        );
-
-        $this->app->singleton(
-            Counters::class, function (Application $app): Counters {
-                $monitor = $app->make(QueueMonitor::class);
-                $store = $app->make(CacheFactory::class)->store($monitor->counterStore())->getStore();
-
-                $this->guardCounterStore($app, $store);
-
-                // A repository of its own, without events: the host's cache
-                // listeners (Pulse, Telescope) have no business with counters.
-                // The registry tracks a few times the published classes, so a
-                // class past the cap still has room before it overflows.
-                return new Counters(new CacheRepository($store), $monitor->counterPrefix(), 4 * $monitor->maxJobClasses());
-            }
-        );
-
-        $this->app->singleton(
-            Collector::class, function (Application $app): Collector {
-                return new Collector(
-                    $app->make(QueueFactory::class),
-                    $app->make(Counters::class),
-                    $app->make('queue.failer'),
-                    $app->make(ExceptionHandler::class),
-                    $app->make(QueueMonitor::class),
-                    $app->make(QueueMonitor::class)->maxJobClasses(),
-                );
-            }
-        );
-
+        $this->app->singleton(QueueMonitor::class);
+        $this->app->singleton(MetricSinkManager::class);
         $this->app->singleton(RecordJobMetrics::class);
+
+        $this->app->singleton(MetricSink::class, fn (Application $app): MetricSink => $app->make(MetricSinkManager::class)->sink());
+
+        $this->app->singleton(Counters::class, function (Application $app): Counters {
+            $monitor = $app->make(QueueMonitor::class);
+            $cache = $app->make(CacheManager::class);
+            $name = $monitor->counterStore() ?? $cache->getDefaultDriver();
+            $store = $cache->store($name)->getStore();
+
+            $this->guardCounterStore($app, $store, $name);
+
+            // A repository of its own, without events: the host's cache
+            // listeners (Pulse, Telescope) have no business with counters.
+            // The registry tracks a few times the published classes, so a
+            // class past the cap still has room before it overflows.
+            return new Counters(new CacheRepository($store), $monitor->counterPrefix(), 4 * $monitor->maxJobClasses());
+        });
     }
 
-    /**
-     * Bootstrap any package services.
-     */
     public function boot(): void {
         if ($this->app->make(QueueMonitor::class)->enabled()) {
-            $this->listenForJobEvents();
+            $events = $this->app->make(Dispatcher::class);
+
+            $events->listen(JobQueued::class, [RecordJobMetrics::class, 'handleJobQueued']);
+            $events->listen(JobProcessed::class, [RecordJobMetrics::class, 'handleJobProcessed']);
+            $events->listen(JobFailed::class, [RecordJobMetrics::class, 'handleJobFailed']);
         }
 
-        if (! $this->app->runningInConsole()) {
-            return;
+        if ($this->app->runningInConsole()) {
+            $this->publishes([__DIR__.'/../config/queue-monitor.php' => $this->app->configPath('queue-monitor.php')], 'queue-monitor-config');
+
+            $this->commands([SampleCommand::class, StatusCommand::class]);
         }
-
-        $this->publishes(
-            [
-                __DIR__.'/../config/queue-monitor.php' => $this->app->configPath('queue-monitor.php'),
-            ], ['queue-monitor', 'queue-monitor-config']
-        );
-
-        $this->commands(
-            [
-                QueueMonitorCommand::class,
-                SampleCommand::class,
-            ]
-        );
-    }
-
-    private function listenForJobEvents(): void {
-        $events = $this->app->make(Dispatcher::class);
-
-        $events->listen(JobQueued::class, [RecordJobMetrics::class, 'handleJobQueued']);
-        $events->listen(JobProcessed::class, [RecordJobMetrics::class, 'handleJobProcessed']);
-        $events->listen(JobFailed::class, [RecordJobMetrics::class, 'handleJobFailed']);
     }
 
     /**
      * Counters must increment atomically across processes and take locks. A
-     * database store on the application's own connection would put a locking
-     * transaction on its primary database for every job, so it must have a
-     * connection of its own. Anything else would quietly lose counts.
+     * Redis store must not share a connection with a Redis queue: bulk
+     * dispatch pushes inside a MULTI there, where a counter or lock command
+     * is only queued.
      */
-    private function guardCounterStore(Application $app, Store $store): void {
-        if ($app->runningUnitTests()) {
+    private function guardCounterStore(Application $app, Store $store, string $name): void {
+        if ($app->runningUnitTests() || $store instanceof DynamoDbStore) {
             return;
         }
 
-        $supported = match (true) {
-            $store instanceof RedisStore, $store instanceof MemcachedStore, $store instanceof DynamoDbStore => true,
-            $store instanceof DatabaseStore => $store->getConnection() !== $app->make(DatabaseManager::class)->connection(),
-            default => false,
-        };
-
-        if (! $supported) {
-            throw new RuntimeException(
-                'The queue-monitor counter store must increment atomically across processes; '
-                .'set queue-monitor.counters.store to a redis, memcached or dynamodb store, '
-                .'or a database store on a connection other than the default one.'
-            );
+        if (! $store instanceof RedisStore) {
+            throw new RuntimeException('The queue-monitor counter store must be a redis or dynamodb store; set queue-monitor.counters.store.');
         }
+
+        $config = $app->make(Repository::class);
+        $connection = $config->get("cache.stores.{$name}.connection");
+        $ours = array_unique([self::redisName($connection), self::redisName($config->get("cache.stores.{$name}.lock_connection") ?? $connection)]);
+
+        foreach ($ours as $redis) {
+            if (! $config->has("database.redis.{$redis}") && ! $config->has("database.redis.clusters.{$redis}")) {
+                throw new RuntimeException("The queue-monitor counter store uses the [{$redis}] Redis connection, which database.redis does not define.");
+            }
+        }
+
+        foreach ((array) $config->get('queue.connections') as $queue) {
+            $theirs = is_array($queue) && ($queue['driver'] ?? null) === 'redis' ? self::redisName($queue['connection'] ?? null) : null;
+
+            if (in_array($theirs, $ours, true)) {
+                throw new RuntimeException(
+                    "The queue-monitor counter store shares the [{$theirs}] Redis connection with a queue; give it a connection and lock_connection of its own."
+                );
+            }
+        }
+    }
+
+    /**
+     * RedisManager resolves an empty or missing name to the default connection.
+     */
+    private static function redisName(mixed $name): string {
+        return is_string($name) && $name !== '' ? $name : 'default';
     }
 }

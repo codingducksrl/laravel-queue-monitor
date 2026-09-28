@@ -4,42 +4,32 @@ declare(strict_types=1);
 
 namespace CodingDuck\QueueMonitor\Console\Commands;
 
-use Closure;
 use CodingDuck\QueueMonitor\Collector;
 use CodingDuck\QueueMonitor\Counters;
 use CodingDuck\QueueMonitor\Metric;
 use CodingDuck\QueueMonitor\MetricSink;
 use CodingDuck\QueueMonitor\QueueMonitor;
-use CodingDuck\QueueMonitor\Sinks\Emf\EmfDocument;
-use Illuminate\Cache\Lock as CacheLock;
+use CodingDuck\QueueMonitor\Sinks\EmfSink;
 use Illuminate\Console\Command;
-use Illuminate\Contracts\Cache\Factory as CacheFactory;
-use Illuminate\Contracts\Cache\Lock;
-use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Debug\ExceptionHandler;
+use RuntimeException;
+use Symfony\Component\Console\Output\OutputInterface;
 use Throwable;
 
-class SampleCommand extends Command {
+final class SampleCommand extends Command {
     /**
      * Well above any sane read of one queue, and refreshed before that queue
-     * is drained. A run holds one queue at a time, so a killed run delays
-     * only that queue, and only until the lock expires.
+     * is drained. A killed run delays only the queue it held.
      */
     private const int LOCK_SECONDS = 300;
 
-    /**
-     * @var string
-     */
     protected $signature = 'queue-monitor:sample
         {queues? : Comma separated connection:queue pairs, defaulting to the configured ones}
         {--dry-run : Print the metrics without publishing or draining them}';
 
-    /**
-     * @var string
-     */
     protected $description = 'Sample queue depth and publish the accumulated queue metrics';
 
-    public function handle(QueueMonitor $monitor, Collector $collector, Counters $counters, CacheFactory $cache): int {
+    public function handle(QueueMonitor $monitor): int {
         if (! $monitor->enabled()) {
             $this->components->warn('Queue monitoring is disabled.');
 
@@ -47,94 +37,47 @@ class SampleCommand extends Command {
         }
 
         $pairs = $this->pairs($monitor);
-
-        if ($this->option('dry-run') === true) {
-            return $this->sample($pairs, $collector, $counters, null);
-        }
-
-        // The locks live in the counter store because that is what a second
-        // sampler would drain twice; it is shared by construction.
-        $store = $cache->store($monitor->counterStore())->getStore();
-
-        if (! $store instanceof LockProvider) {
-            $this->fail('The counter store cannot take the sampler lock.');
-        }
-
-        return $this->sample(
-            $pairs,
-            $collector,
-            $counters,
-            $this->laravel->make(MetricSink::class),
-            fn (string $connection, string $queue): Lock => $store->lock(
-                $monitor->counterPrefix().':sample:'.hash('xxh128', $connection."\0".$queue),
-                self::LOCK_SECONDS,
-            ),
-        );
-    }
-
-    /**
-     * One broken or slow queue must not blank the others, so each pair stands
-     * alone, under a lock of its own.
-     *
-     * @param list<array{0: string, 1: string}>    $pairs
-     * @param (Closure(string, string): Lock)|null $lockFor
-     */
-    private function sample(array $pairs, Collector $collector, Counters $counters, ?MetricSink $sink, ?Closure $lockFor = null): int {
+        $collector = $this->laravel->make(Collector::class);
+        $counters = $this->laravel->make(Counters::class);
+        $sink = $this->option('dry-run') === true ? null : $this->laravel->make(MetricSink::class);
         $status = self::SUCCESS;
 
         foreach ($pairs as [$connection, $queue]) {
-            $lock = null;
-
             try {
-                $candidate = $lockFor === null ? null : $lockFor($connection, $queue);
-
-                if ($candidate !== null && ! $candidate->get()) {
-                    $this->components->warn("{$connection}:{$queue} is being sampled by another run; skipping.");
-
-                    continue;
-                }
-
-                $lock = $candidate;
-                [$metrics, $readings] = $collector->collect($connection, $queue);
-
                 if ($sink === null) {
-                    $this->render($metrics);
+                    $this->render($collector->collect($connection, $queue)[0]);
 
                     continue;
                 }
 
-                // A run that outlived its lock may be racing a newer one for
-                // these counters; never drain them twice. MySQL reports a
-                // refresh within the same second as changing no rows, so
-                // ownership decides.
-                if ($lock instanceof CacheLock && ! $lock->refresh() && ! $lock->isOwnedByCurrentProcess()) {
-                    $status = self::FAILURE;
-                    $this->components->error("{$connection}:{$queue}: lost the sampler lock; not draining it.");
+                $lock = $counters->lock($connection, $queue, self::LOCK_SECONDS);
 
-                    continue;
+                $sampled = $lock->get(function () use ($lock, $collector, $counters, $sink, $connection, $queue): bool {
+                    [$metrics, $readings] = $collector->collect($connection, $queue);
+
+                    // A run that outlived its lock may be racing a newer one; never drain twice.
+                    if (! $lock->refresh()) {
+                        throw new RuntimeException('Lost the sampler lock; not draining it.');
+                    }
+
+                    $sink->write($metrics);
+                    $counters->commit($connection, $queue, $readings);
+
+                    return true;
+                });
+
+                if ($sampled === false) {
+                    $this->components->warn("{$connection}:{$queue} is being sampled by another run; skipping.");
                 }
-
-                $sink->write($metrics);
-                $counters->commit($connection, $queue, $readings);
             } catch (Throwable $e) {
                 $status = self::FAILURE;
 
-                $this->report($e);
+                $this->laravel->make(ExceptionHandler::class)->report($e);
                 $this->components->error("{$connection}:{$queue}: {$e->getMessage()}");
-            } finally {
-                try {
-                    $lock?->release();
-                } catch (Throwable $e) {
-                    $this->report($e);
-                }
             }
         }
 
         return $status;
-    }
-
-    private function report(Throwable $e): void {
-        $this->laravel->make(ExceptionHandler::class)->report($e);
     }
 
     /**
@@ -173,8 +116,7 @@ class SampleCommand extends Command {
     }
 
     /**
-     * Shows exactly what would be published, which also keeps producer
-     * supplied names from writing control sequences to the terminal.
+     * Raw, so dimension values print exactly as the EMF sink publishes them.
      *
      * @param list<Metric> $metrics
      */
@@ -183,13 +125,10 @@ class SampleCommand extends Command {
             $dimensions = [];
 
             foreach ($metric->dimensions as $name => $value) {
-                $dimensions[] = "{$name}=".EmfDocument::sanitise($value);
+                $dimensions[] = "{$name}=".EmfSink::sanitise($value);
             }
 
-            $this->components->twoColumnDetail(
-                $metric->name.' '.implode(' ', $dimensions),
-                $metric->value.' '.$metric->unit->value,
-            );
+            $this->output->writeln($metric->name.' '.implode(' ', $dimensions).' '.$metric->value, OutputInterface::OUTPUT_RAW);
         }
     }
 }

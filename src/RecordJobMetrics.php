@@ -17,11 +17,6 @@ use Throwable;
 
 use function Illuminate\Support\enum_value;
 
-/**
- * Counts as the event fires. The counter store is never the application's own
- * database connection (the provider refuses that), so a write cannot join,
- * lock inside or abort the application's transaction.
- */
 final class RecordJobMetrics {
     use InteractsWithTime;
 
@@ -70,15 +65,9 @@ final class RecordJobMetrics {
      * the failover connection for jobs that were pushed to the one behind it.
      */
     private function recordJob(Job $job, string $metric): void {
-        // A payload that cannot be read is the job's problem, not the store's,
-        // so it must not trip the stand-down below.
-        try {
-            $name = $job->resolveName();
-        } catch (Throwable) {
-            $name = null;
-        }
+        $payload = $job->payload();
 
-        $this->record($job->getConnectionName(), (string) $job->getQueue(), Counters::label($name), $metric);
+        $this->record($job->getConnectionName(), (string) $job->getQueue(), self::label($payload['displayName'] ?? $payload['job'] ?? null), $metric);
     }
 
     private function record(string $connection, string $queue, string $class, string $metric): void {
@@ -94,7 +83,7 @@ final class RecordJobMetrics {
      * job itself rather than by decoding the whole payload.
      */
     private function displayName(mixed $job): string {
-        return Counters::label(match (true) {
+        return self::label(match (true) {
             $job instanceof Closure => CallQueuedClosure::create($job)->displayName(),
             is_object($job) => method_exists($job, 'displayName') ? $job->displayName() : $job::class,
             is_string($job) => explode('@', $job)[0],
@@ -103,9 +92,16 @@ final class RecordJobMetrics {
     }
 
     /**
-     * A metrics failure must never reach the job or the request. The counter
-     * store is resolved in here too, so a misconfigured one is reported
-     * rather than thrown into dispatch().
+     * Names are stored in the registry the sampler reads, so they are capped.
+     */
+    private static function label(mixed $name): string {
+        return is_string($name) && $name !== '' ? mb_substr($name, 0, 255) : 'unknown';
+    }
+
+    /**
+     * A metrics failure must never reach the job or the request. Counters is
+     * resolved in here, so a misconfigured store is reported rather than
+     * thrown into dispatch().
      */
     private function guard(Closure $callback): void {
         if ($this->pausedUntil > $this->currentTime()) {

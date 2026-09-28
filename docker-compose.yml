@@ -20,6 +20,7 @@ services:
     environment:
       WWWUSER: '${WWWUSER}'
       LARAVEL_SAIL: 1
+      REDIS_HOST: redis
     volumes:
       - '.:/var/www/html'
     networks: [sail,proxy]

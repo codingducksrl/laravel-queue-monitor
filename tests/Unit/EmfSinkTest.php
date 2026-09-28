@@ -3,19 +3,13 @@
 declare(strict_types=1);
 
 use CodingDuck\QueueMonitor\Metric;
-use CodingDuck\QueueMonitor\Sinks\Emf\EmfSink;
-use CodingDuck\QueueMonitor\Sinks\Emf\StdoutEmitter;
-use CodingDuck\QueueMonitor\Tests\Support\FakeEmitter;
+use CodingDuck\QueueMonitor\Sinks\EmfSink;
 use Illuminate\Support\Carbon;
 
 beforeEach(function (): void {
     Carbon::setTestNow(Carbon::parse('2026-09-21T09:00:00Z'));
-    $this->emitter = new FakeEmitter;
-    $this->sink = new EmfSink($this->emitter, 'Acme/Queues');
-});
-
-afterEach(function (): void {
-    Carbon::setTestNow();
+    $this->out = new SplFileObject('php://memory', 'w+');
+    $this->sink = new EmfSink('Acme/Queues', [], $this->out);
 });
 
 function queueLevel(): array {
@@ -26,25 +20,54 @@ function classLevel(string $class): array {
     return ['Connection' => 'redis', 'Queue' => 'default', 'JobClass' => $class];
 }
 
-it('emits one document per dimension tuple', function (): void {
-    $this->sink->write([
-        Metric::make('JobsCompleted', 165, queueLevel()),
-        Metric::make('JobsCompleted', 120, classLevel('App\Jobs\SendInvoice')),
-        Metric::make('JobsCompleted', 45, classLevel('App\Jobs\SyncContact')),
+function written(SplFileObject $out): string {
+    $out->rewind();
+
+    return (string) $out->fread(1 << 20);
+}
+
+function documents(SplFileObject $out): array {
+    return array_map(
+        fn (string $line): array => json_decode($line, true, 512, JSON_THROW_ON_ERROR),
+        array_values(array_filter(explode("\n", written($out)))),
+    );
+}
+
+it('emits the document shape the EMF specification requires', function (): void {
+    $out = new SplFileObject('php://memory', 'w+');
+
+    (new EmfSink('Acme/Queues', ['Service' => 'checkout', 'Environment' => 'production'], $out))->write([
+        new Metric('JobsPending', 42, queueLevel()),
+        new Metric('JobsCompleted', 165, queueLevel()),
     ]);
 
-    expect($this->emitter->documents())->toHaveCount(3);
+    expect(written($out))->toBe(
+        '{"Service":"checkout","Environment":"production","Connection":"redis","Queue":"default",'
+        .'"JobsPending":42,"JobsCompleted":165,"_aws":{"Timestamp":1789981200000,"CloudWatchMetrics":'
+        .'[{"Namespace":"Acme/Queues","Dimensions":[["Connection","Queue"]],"Metrics":'
+        .'[{"Name":"JobsPending","Unit":"Count"},{"Name":"JobsCompleted","Unit":"Count"}]}]}}'."\n"
+    );
+});
+
+it('emits one document per dimension tuple', function (): void {
+    $this->sink->write([
+        new Metric('JobsCompleted', 165, queueLevel()),
+        new Metric('JobsCompleted', 120, classLevel('App\Jobs\SendInvoice')),
+        new Metric('JobsCompleted', 45, classLevel('App\Jobs\SyncContact')),
+    ]);
+
+    expect(documents($this->out))->toHaveCount(3);
 });
 
 it('gives every document exactly one dimension set matching its own tuple', function (): void {
     $this->sink->write([
-        Metric::make('JobsCompleted', 165, queueLevel()),
-        Metric::make('JobsCompleted', 120, classLevel('App\Jobs\SendInvoice')),
+        new Metric('JobsCompleted', 165, queueLevel()),
+        new Metric('JobsCompleted', 120, classLevel('App\Jobs\SendInvoice')),
     ]);
 
     $sets = array_map(
         static fn (array $document): array => $document['_aws']['CloudWatchMetrics'][0]['Dimensions'],
-        $this->emitter->documents(),
+        documents($this->out),
     );
 
     expect($sets)->toBe([
@@ -55,14 +78,14 @@ it('gives every document exactly one dimension set matching its own tuple', func
 
 it('publishes the queue level value exactly once across the batch', function (): void {
     $this->sink->write([
-        Metric::make('JobsCompleted', 165, queueLevel()),
-        Metric::make('JobsCompleted', 120, classLevel('App\Jobs\SendInvoice')),
-        Metric::make('JobsCompleted', 45, classLevel('App\Jobs\SyncContact')),
+        new Metric('JobsCompleted', 165, queueLevel()),
+        new Metric('JobsCompleted', 120, classLevel('App\Jobs\SendInvoice')),
+        new Metric('JobsCompleted', 45, classLevel('App\Jobs\SyncContact')),
     ]);
 
     $published = [];
 
-    foreach ($this->emitter->documents() as $document) {
+    foreach (documents($this->out) as $document) {
         foreach ($document['_aws']['CloudWatchMetrics'][0]['Dimensions'] as $set) {
             $tuple = [];
 
@@ -76,21 +99,18 @@ it('publishes the queue level value exactly once across the batch', function ():
         }
     }
 
-    expect($published)->toHaveCount(count(array_unique($published)));
-
-    $queueSeries = 'JobsCompleted|'.json_encode(queueLevel());
-
-    expect(array_count_values($published)[$queueSeries])->toBe(1);
+    expect($published)->toHaveCount(count(array_unique($published)))
+        ->and(array_count_values($published)['JobsCompleted|'.json_encode(queueLevel())])->toBe(1);
 });
 
 it('packs every metric sharing a tuple into one document', function (): void {
     $this->sink->write([
-        Metric::make('JobsPending', 42, queueLevel()),
-        Metric::make('JobsDelayed', 7, queueLevel()),
-        Metric::make('JobsInProgress', 3, queueLevel()),
+        new Metric('JobsPending', 42, queueLevel()),
+        new Metric('JobsDelayed', 7, queueLevel()),
+        new Metric('JobsInProgress', 3, queueLevel()),
     ]);
 
-    $documents = $this->emitter->documents();
+    $documents = documents($this->out);
 
     expect($documents)->toHaveCount(1)
         ->and($documents[0]['_aws']['CloudWatchMetrics'][0]['Metrics'])->toHaveCount(3)
@@ -98,54 +118,89 @@ it('packs every metric sharing a tuple into one document', function (): void {
 });
 
 it('stamps the current time in epoch milliseconds', function (): void {
-    $this->sink->write([Metric::make('JobsPending', 1, queueLevel())]);
+    $this->sink->write([new Metric('JobsPending', 1, queueLevel())]);
 
-    expect($this->emitter->documents()[0]['_aws']['Timestamp'])->toBe(1789981200000);
+    expect(documents($this->out)[0]['_aws']['Timestamp'])->toBe(1789981200000);
 });
 
-it('writes nothing for an empty batch', function (): void {
-    $this->sink->write([]);
+it('writes each document as its own newline terminated line', function (): void {
+    $out = new class('php://memory', 'w+') extends SplFileObject {
+        public array $writes = [];
 
-    expect($this->emitter->lines)->toBeEmpty();
-});
+        public function fwrite(string $data, mixed $length = null): int|false {
+            $this->writes[] = $data;
 
-it('writes one newline terminated line per document to its stream', function (): void {
-    $handle = new SplFileObject('php://memory', 'r+');
+            return parent::fwrite($data);
+        }
+    };
 
-    (new StdoutEmitter($handle))->emit('{"a":1}');
-    (new StdoutEmitter($handle))->emit('{"b":2}');
+    (new EmfSink('Acme/Queues', [], $out))->write([new Metric('JobsPending', 1, queueLevel()), new Metric('JobsPending', 2, classLevel('A'))]);
 
-    $handle->rewind();
-
-    expect($handle->fread(1024))->toBe("{\"a\":1}\n{\"b\":2}\n");
+    expect($out->writes)->toHaveCount(2)->each->toEndWith("}\n");
 });
 
 it('groups dimensions that are not valid UTF-8 without failing', function (): void {
-    $this->sink->write([Metric::make('JobsPending', 1, ['Connection' => 'redis', 'Queue' => "bad\xFF"])]);
+    $this->sink->write([new Metric('JobsPending', 1, ['Connection' => 'redis', 'Queue' => "bad\xFF"])]);
 
-    expect($this->emitter->documents()[0]['Queue'])->toStartWith('bad#');
+    expect(documents($this->out)[0]['Queue'])->toStartWith('bad#');
 });
 
-it('emits nothing from a batch that cannot be encoded in full', function (): void {
-    expect(fn () => $this->sink->write([
-        Metric::make('JobsPending', 1, queueLevel()),
-        Metric::make('JobsPending', INF, classLevel('App\Jobs\SendInvoice')),
-    ]))->toThrow(JsonException::class);
+it('sanitises entity values and never lets one replace the metadata', function (): void {
+    $out = new SplFileObject('php://memory', 'w+');
 
-    expect($this->emitter->lines)->toBeEmpty();
+    (new EmfSink('Acme/Queues', ['_aws' => 'broken', 'Service' => "check\nout"], $out))
+        ->write([new Metric('JobsPending', 1, ['Queue' => 'default'])]);
+
+    $document = documents($out)[0];
+
+    expect($document['_aws'])->toBeArray()->and($document['Service'])->toStartWith('check out#');
 });
 
 it('treats a short write as a failure', function (): void {
-    $handle = new class('php://memory', 'r+') extends SplFileObject {
+    $out = new class('php://memory', 'w+') extends SplFileObject {
         public function fwrite(string $data, mixed $length = null): int|false {
             return parent::fwrite(substr($data, 0, 3));
         }
     };
 
-    expect(fn () => (new StdoutEmitter($handle))->emit('{"a":1}'))->toThrow(RuntimeException::class, 'Unable to write');
+    expect(fn () => (new EmfSink('Acme/Queues', [], $out))->write([new Metric('JobsPending', 1, queueLevel())]))
+        ->toThrow(RuntimeException::class, 'Unable to write');
 });
 
 it('refuses to write into /dev/null', function (): void {
-    expect(fn () => (new StdoutEmitter(new SplFileObject('/dev/null', 'wb')))->emit('{"a":1}'))
+    expect(fn () => (new EmfSink('Acme/Queues', [], new SplFileObject('/dev/null', 'wb')))->write([new Metric('JobsPending', 1, queueLevel())]))
         ->toThrow(RuntimeException::class, 'appendOutputTo');
 })->skipOnWindows();
+
+it('rejects a namespace CloudWatch would drop', function (string $namespace): void {
+    expect(fn (): EmfSink => new EmfSink($namespace))->toThrow(InvalidArgumentException::class, 'EMF namespace');
+})->with(['', str_repeat('n', 256), "Laravel/Queue\n", 'AWS/SQS', ':Queues', 'Queues!']);
+
+it('strips control characters that would void the whole record', function (): void {
+    expect(EmfSink::sanitise("Send\x00Invoice\x1F"))->toStartWith('SendInvoice#')
+        ->and(EmfSink::sanitise("a\nb"))->toStartWith('a b#');
+});
+
+it('keeps a backslashed job class verbatim', function (): void {
+    expect(EmfSink::sanitise('App\Jobs\SendInvoice'))->toBe('App\Jobs\SendInvoice');
+});
+
+it('folds an empty dimension value rather than voiding the record', function (string $value): void {
+    expect(EmfSink::sanitise($value))->toBe('__unknown__');
+})->with(['', '   ', "\t"]);
+
+it('keeps only the printable ASCII CloudWatch accepts', function (): void {
+    expect(EmfSink::sanitise('Café'))->toMatch('/^Cafe#[0-9a-f]{8}$/')
+        ->and(EmfSink::sanitise("App\\Jobs\\\xFF\xFEBad"))->toStartWith('App\\Jobs\\Bad#')
+        ->and(EmfSink::sanitise("\u{202E}evil\u{009B}"))->toStartWith('evil#');
+});
+
+it('never collapses two names onto one series', function (): void {
+    expect(EmfSink::sanitise('Отчёт'))->not->toBe(EmfSink::sanitise('Счёт'))
+        ->and(EmfSink::sanitise('Café'))->not->toBe(EmfSink::sanitise('Cafe'));
+});
+
+it('truncates a long value to the dimension limit', function (): void {
+    expect(strlen(EmfSink::sanitise(str_repeat('v', 2000))))->toBe(1024)
+        ->and(strlen(EmfSink::sanitise(str_repeat('é', 2000))))->toBe(1024);
+});

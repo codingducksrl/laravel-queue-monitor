@@ -20,11 +20,7 @@ final class MetricName {
     public const string FailedJobsTotal = 'FailedJobsTotal';
 
     /**
-     * The counters accumulated by the listener and drained by the sampler.
-     *
-     * @return list<string>
+     * Accumulated by the listener and drained by the sampler.
      */
-    public static function counters(): array {
-        return [self::JobsQueued, self::JobsCompleted, self::JobsFailed];
-    }
+    public const array COUNTERS = [self::JobsQueued, self::JobsCompleted, self::JobsFailed];
 }
