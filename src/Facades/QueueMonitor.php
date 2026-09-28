@@ -8,9 +8,8 @@ use Illuminate\Support\Facades\Facade;
 
 /**
  * @method static bool                              enabled()
- * @method static list<string>                      connections()
- * @method static bool                              monitors(string $connection)
  * @method static list<array{0: string, 1: string}> sampledQueues()
+ * @method static string|null                       monitoredQueue(string $connection, string $queue)
  * @method static string                            defaultConnection()
  * @method static string                            defaultQueue(string $connection)
  * @method static string                            sink()

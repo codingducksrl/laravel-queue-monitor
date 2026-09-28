@@ -6,13 +6,19 @@ namespace CodingDuck\QueueMonitor;
 
 use CodingDuck\QueueMonitor\Console\Commands\QueueMonitorCommand;
 use CodingDuck\QueueMonitor\Console\Commands\SampleCommand;
-use Illuminate\Cache\ArrayStore;
-use Illuminate\Cache\FileStore;
+use Illuminate\Cache\DatabaseStore;
+use Illuminate\Cache\DynamoDbStore;
+use Illuminate\Cache\MemcachedStore;
+use Illuminate\Cache\RedisStore;
+use Illuminate\Cache\Repository as CacheRepository;
 use Illuminate\Contracts\Cache\Factory as CacheFactory;
+use Illuminate\Contracts\Cache\Store;
 use Illuminate\Contracts\Config\Repository;
+use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Contracts\Queue\Factory as QueueFactory;
+use Illuminate\Database\DatabaseManager;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobQueued;
@@ -28,7 +34,7 @@ class QueueMonitorServiceProvider extends ServiceProvider {
 
         $this->app->singleton(
             QueueMonitor::class, function (Application $app): QueueMonitor {
-                return new QueueMonitor($app->make(Repository::class));
+                return new QueueMonitor($app->make(Repository::class), $app);
             }
         );
 
@@ -47,11 +53,15 @@ class QueueMonitorServiceProvider extends ServiceProvider {
         $this->app->singleton(
             Counters::class, function (Application $app): Counters {
                 $monitor = $app->make(QueueMonitor::class);
-                $cache = $app->make(CacheFactory::class)->store($monitor->counterStore());
+                $store = $app->make(CacheFactory::class)->store($monitor->counterStore())->getStore();
 
-                $this->guardCounterStore($app, $cache->getStore());
+                $this->guardCounterStore($app, $store);
 
-                return new Counters($cache, $monitor->counterPrefix());
+                // A repository of its own, without events: the host's cache
+                // listeners (Pulse, Telescope) have no business with counters.
+                // The registry tracks a few times the published classes, so a
+                // class past the cap still has room before it overflows.
+                return new Counters(new CacheRepository($store), $monitor->counterPrefix(), 4 * $monitor->maxJobClasses());
             }
         );
 
@@ -61,18 +71,20 @@ class QueueMonitorServiceProvider extends ServiceProvider {
                     $app->make(QueueFactory::class),
                     $app->make(Counters::class),
                     $app->make('queue.failer'),
+                    $app->make(ExceptionHandler::class),
+                    $app->make(QueueMonitor::class),
                     $app->make(QueueMonitor::class)->maxJobClasses(),
                 );
             }
         );
+
+        $this->app->singleton(RecordJobMetrics::class);
     }
 
     /**
      * Bootstrap any package services.
      */
     public function boot(): void {
-        $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
-
         if ($this->app->make(QueueMonitor::class)->enabled()) {
             $this->listenForJobEvents();
         }
@@ -83,14 +95,8 @@ class QueueMonitorServiceProvider extends ServiceProvider {
 
         $this->publishes(
             [
-                __DIR__.'/../config/queue-monitor.php' => config_path('queue-monitor.php'),
+                __DIR__.'/../config/queue-monitor.php' => $this->app->configPath('queue-monitor.php'),
             ], ['queue-monitor', 'queue-monitor-config']
-        );
-
-        $this->publishes(
-            [
-                __DIR__.'/../database/migrations' => database_path('migrations'),
-            ], ['queue-monitor', 'queue-monitor-migrations']
         );
 
         $this->commands(
@@ -110,19 +116,27 @@ class QueueMonitorServiceProvider extends ServiceProvider {
     }
 
     /**
-     * Counters must increment atomically across processes. An array store is a
-     * per-process buffer and a file store is not atomic under concurrency, so
-     * either would quietly lose counts.
+     * Counters must increment atomically across processes and take locks. A
+     * database store on the application's own connection would put a locking
+     * transaction on its primary database for every job, so it must have a
+     * connection of its own. Anything else would quietly lose counts.
      */
-    private function guardCounterStore(Application $app, object $store): void {
+    private function guardCounterStore(Application $app, Store $store): void {
         if ($app->runningUnitTests()) {
             return;
         }
 
-        if ($store instanceof ArrayStore || $store instanceof FileStore) {
+        $supported = match (true) {
+            $store instanceof RedisStore, $store instanceof MemcachedStore, $store instanceof DynamoDbStore => true,
+            $store instanceof DatabaseStore => $store->getConnection() !== $app->make(DatabaseManager::class)->connection(),
+            default => false,
+        };
+
+        if (! $supported) {
             throw new RuntimeException(
                 'The queue-monitor counter store must increment atomically across processes; '
-                .'set queue-monitor.counters.store to a redis, memcached, database or dynamodb store.'
+                .'set queue-monitor.counters.store to a redis, memcached or dynamodb store, '
+                .'or a database store on a connection other than the default one.'
             );
         }
     }

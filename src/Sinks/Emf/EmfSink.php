@@ -19,17 +19,25 @@ final readonly class EmfSink implements MetricSink {
     ) {}
 
     /**
+     * Every document is encoded before the first is emitted, so a batch that
+     * cannot be serialised publishes nothing rather than half of itself.
+     *
      * @param list<Metric> $metrics
      */
     public function write(array $metrics): void {
         $timestamp = Carbon::now()->getTimestampMs();
+        $lines = [];
 
         foreach ($this->group($metrics) as [$dimensions, $grouped]) {
             $document = new EmfDocument($this->namespace, $timestamp, $dimensions, $grouped, $this->entity);
 
             foreach ($document->chunk() as $part) {
-                $this->emitter->emit($part->toJson());
+                $lines[] = $part->toJson();
             }
+        }
+
+        foreach ($lines as $line) {
+            $this->emitter->emit($line);
         }
     }
 
@@ -43,7 +51,7 @@ final readonly class EmfSink implements MetricSink {
         $groups = [];
 
         foreach ($metrics as $metric) {
-            $key = json_encode($metric->dimensions, JSON_THROW_ON_ERROR);
+            $key = serialize($metric->dimensions);
 
             $groups[$key][0] = $metric->dimensions;
             $groups[$key][1][] = $metric;

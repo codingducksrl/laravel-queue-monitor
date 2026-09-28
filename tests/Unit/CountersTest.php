@@ -2,14 +2,23 @@
 
 declare(strict_types=1);
 
+use CodingDuck\QueueMonitor\Collector;
 use CodingDuck\QueueMonitor\Counters;
 use CodingDuck\QueueMonitor\MetricName;
 use Illuminate\Cache\ArrayStore;
 use Illuminate\Cache\Repository;
 
 beforeEach(function (): void {
-    $this->counters = new Counters(new Repository(new ArrayStore), 'qm-test');
+    $this->store = new ArrayStore;
+    $this->counters = new Counters(new Repository($this->store), 'qm-test');
 });
+
+function drain(Counters $counters, string $queue = 'default'): array {
+    $readings = $counters->read('redis', $queue, MetricName::counters());
+    $counters->commit('redis', $queue, $readings);
+
+    return $readings;
+}
 
 it('accumulates counts per connection, queue, metric and job class', function (): void {
     $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\SendInvoice');
@@ -30,7 +39,26 @@ it('keeps counts on separate queues apart', function (): void {
         ->toBe([MetricName::JobsCompleted => ['App\Jobs\SendInvoice' => 1]]);
 });
 
-it('registers each job class once', function (): void {
+it('keeps names that would collide once joined apart', function (): void {
+    $this->counters->increment('a:b', 'c', MetricName::JobsCompleted, 'App\Jobs\A');
+    $this->counters->increment('a', 'b:c', MetricName::JobsCompleted, 'App\Jobs\A');
+    $this->counters->increment('a', 'b:c', MetricName::JobsCompleted, 'App.Jobs.A');
+
+    expect($this->counters->read('a:b', 'c', MetricName::counters()))
+        ->toBe([MetricName::JobsCompleted => ['App\Jobs\A' => 1]])
+        ->and($this->counters->read('a', 'b:c', MetricName::counters()))
+        ->toBe([MetricName::JobsCompleted => ['App\Jobs\A' => 1, 'App.Jobs.A' => 1]]);
+});
+
+it('builds keys every store accepts whatever the job is called', function (): void {
+    $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'Closure (routes/web.php:12) '.str_repeat('x', 300));
+
+    foreach (array_keys((fn (): array => $this->storage)->call($this->store)) as $key) {
+        expect(strlen($key))->toBeLessThanOrEqual(250)->and($key)->not->toMatch('/[\s\x00-\x1F]/');
+    }
+});
+
+it('registers each job class once, in the order first seen', function (): void {
     $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\SendInvoice');
     $this->counters->increment('redis', 'default', MetricName::JobsFailed, 'App\Jobs\SendInvoice');
     $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\SyncContact');
@@ -46,8 +74,7 @@ it('reports no classes for a queue that has seen nothing', function (): void {
 it('omits counters that are back at zero', function (): void {
     $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\SendInvoice');
 
-    $readings = $this->counters->read('redis', 'default', MetricName::counters());
-    $this->counters->commit('redis', 'default', $readings);
+    drain($this->counters);
 
     expect($this->counters->read('redis', 'default', MetricName::counters()))->toBe([]);
 });
@@ -67,4 +94,258 @@ it('keeps increments that land between the read and the commit', function (): vo
     expect($readings[MetricName::JobsCompleted]['App\Jobs\SendInvoice'])->toBe(10)
         ->and($this->counters->read('redis', 'default', MetricName::counters()))
         ->toBe([MetricName::JobsCompleted => ['App\Jobs\SendInvoice' => 1]]);
+});
+
+it('costs one store call per event between re-checks', function (): void {
+    $spy = new class extends ArrayStore {
+        public array $calls = [];
+
+        private bool $inside = false;
+
+        public function get($key) {
+            if (! $this->inside) {
+                $this->calls[] = 'get';
+            }
+
+            return parent::get($key);
+        }
+
+        public function increment($key, $value = 1) {
+            $this->calls[] = 'increment';
+            $this->inside = true;
+
+            try {
+                return parent::increment($key, $value);
+            } finally {
+                $this->inside = false;
+            }
+        }
+    };
+
+    // A fresh instance per event, the way PHP-FPM sees it. The 1st and 2nd
+    // events re-check the registry; the 3rd is past both marks.
+    foreach (range(1, 2) as $ignored) {
+        (new Counters(new Repository($spy), 'qm'))->increment('redis', 'default', MetricName::JobsQueued, 'App\Jobs\A');
+    }
+
+    $spy->calls = [];
+    (new Counters(new Repository($spy), 'qm'))->increment('redis', 'default', MetricName::JobsQueued, 'App\Jobs\A');
+
+    expect($spy->calls)->toBe(['increment']);
+});
+
+it('seeds a missing key with the store\'s own atomic add', function (): void {
+    // Database, memcached and DynamoDB refuse to increment a key that does not exist.
+    $store = new class extends ArrayStore {
+        public array $adds = [];
+
+        public function increment($key, $value = 1) {
+            return $this->get($key) === null ? false : parent::increment($key, $value);
+        }
+
+        public function add($key, $value, $seconds): bool {
+            $this->adds[] = $seconds;
+
+            if ($this->get($key) !== null) {
+                return false;
+            }
+
+            return $this->put($key, $value, $seconds);
+        }
+    };
+
+    $counters = new Counters(new Repository($store), 'qm');
+    $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+    $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+
+    expect($store->adds)->toBe([157_680_000])
+        ->and($counters->read('redis', 'default', MetricName::counters()))
+        ->toBe([MetricName::JobsCompleted => ['App\Jobs\A' => 2]]);
+});
+
+it('registers the class again once its registry entry is lost', function (): void {
+    $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+    $this->store->flush();
+
+    $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+
+    expect($this->counters->read('redis', 'default', MetricName::counters()))
+        ->toBe([MetricName::JobsCompleted => ['App\Jobs\A' => 1]]);
+});
+
+it('finds a counter that kept running while its class was dropped from the registry', function (): void {
+    $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+    $this->store->forget('qm-test:c:'.hash('xxh128', "redis\0default"));
+
+    foreach (range(2, 100) as $ignored) {
+        $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+    }
+
+    expect($this->counters->read('redis', 'default', MetricName::counters()))
+        ->toBe([MetricName::JobsCompleted => ['App\Jobs\A' => 100]]);
+});
+
+it('counts classes past the registry cap in the overflow bucket', function (): void {
+    $counters = new Counters(new Repository($this->store), 'qm-cap', 2);
+
+    foreach (['A', 'B', 'C', 'D', 'C'] as $class) {
+        $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\\'.$class);
+    }
+
+    $overflowed = 'qm-cap:v:'.hash('xxh128', implode("\0", ['redis', 'default', MetricName::JobsCompleted, 'App\Jobs\C']));
+    $entry = (fn (): array => $this->storage[$overflowed])->call($this->store);
+
+    expect($counters->classes('redis', 'default'))->toBe(['App\Jobs\A', 'App\Jobs\B', Collector::OTHER])
+        ->and($counters->read('redis', 'default', MetricName::counters()))
+        ->toBe([MetricName::JobsCompleted => ['App\Jobs\A' => 1, 'App\Jobs\B' => 1, Collector::OTHER => 3]])
+        ->and($entry['value'])->toBeGreaterThanOrEqual(1_000_000_000_000_000)
+        ->and($entry['expiresAt'])->not->toBe(0);
+});
+
+it('drains a class whose name is a number', function (): void {
+    $this->counters->increment('redis', 'default', MetricName::JobsCompleted, '42');
+
+    expect(drain($this->counters))->toBe([MetricName::JobsCompleted => [42 => 1]])
+        ->and($this->counters->read('redis', 'default', MetricName::counters()))->toBe([]);
+});
+
+it('reads counters in batches every store accepts', function (): void {
+    $spy = new class extends ArrayStore {
+        public array $batches = [];
+
+        public function many(array $keys) {
+            $this->batches[] = count($keys);
+
+            return parent::many($keys);
+        }
+    };
+    $counters = new Counters(new Repository($spy), 'qm');
+
+    foreach (range(1, 40) as $i) {
+        $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\Job'.$i);
+    }
+
+    expect($counters->read('redis', 'default', MetricName::counters()))->toHaveKey(MetricName::JobsCompleted)
+        ->and($spy->batches)->toBe([100, 20]);
+});
+
+it('does not leave a counter negative when its key vanished before the commit', function (): void {
+    foreach (range(1, 5) as $ignored) {
+        $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+    }
+
+    $readings = $this->counters->read('redis', 'default', MetricName::counters());
+    $this->store->flush();
+    $this->counters->commit('redis', 'default', $readings);
+
+    $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+
+    expect($this->counters->read('redis', 'default', MetricName::counters()))
+        ->toBe([MetricName::JobsCompleted => ['App\Jobs\A' => 1]]);
+});
+
+it('keeps counting while another process holds the registry lock', function (): void {
+    $this->store->lock('qm-test:c:'.hash('xxh128', "redis\0default").':lock', 60)->get();
+
+    $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+
+    expect($this->counters->classes('redis', 'default'))->toBe([]);
+
+    (fn () => $this->locks = [])->call($this->store);
+
+    foreach (range(2, 100) as $ignored) {
+        $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+    }
+
+    expect($this->counters->read('redis', 'default', MetricName::counters()))
+        ->toBe([MetricName::JobsCompleted => ['App\Jobs\A' => 100]]);
+});
+
+it('costs two store calls per event for a class past the registry cap', function (): void {
+    $spy = new class extends ArrayStore {
+        public array $calls = [];
+
+        public function get($key) {
+            $this->calls[] = 'get';
+
+            return parent::get($key);
+        }
+
+        public function increment($key, $value = 1) {
+            $this->calls[] = 'increment';
+
+            return parent::increment($key, $value);
+        }
+    };
+    $counters = new Counters(new Repository($spy), 'qm', 1);
+
+    $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+    $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\B');
+    $spy->calls = [];
+    $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\B');
+
+    expect(array_values(array_diff($spy->calls, ['get'])))->toBe(['increment', 'increment'])
+        ->and($counters->read('redis', 'default', MetricName::counters()))
+        ->toBe([MetricName::JobsCompleted => ['App\Jobs\A' => 1, Collector::OTHER => 2]]);
+});
+
+it('moves increments that race the parking of a class past the cap', function (): void {
+    $counters = new Counters(new Repository($this->store), 'qm-race', 1);
+    $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+
+    // Another process counted B twice before this one parked it.
+    $key = 'qm-race:v:'.hash('xxh128', implode("\0", ['redis', 'default', MetricName::JobsCompleted, 'App\Jobs\B']));
+    $this->store->increment($key, 2);
+    $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\B');
+
+    foreach (range(1, 100) as $ignored) {
+        $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\B');
+    }
+
+    expect($counters->read('redis', 'default', MetricName::counters()))
+        ->toBe([MetricName::JobsCompleted => ['App\Jobs\A' => 1, Collector::OTHER => 103]]);
+});
+
+it('undoes a second park so nothing is moved twice', function (): void {
+    $counters = new Counters(new Repository($this->store), 'qm-twice', 1);
+    $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+
+    $key = 'qm-twice:v:'.hash('xxh128', implode("\0", ['redis', 'default', MetricName::JobsCompleted, 'App\Jobs\B']));
+    $this->store->increment($key, 1_000_000_000_000_000 + 99);
+    $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\B');
+
+    expect($counters->read('redis', 'default', MetricName::counters()))
+        ->toBe([MetricName::JobsCompleted => ['App\Jobs\A' => 1, Collector::OTHER => 1]]);
+});
+
+it('counts into the overflow bucket when a store refuses a parked key for a second', function (): void {
+    $refusing = 'qm-edge:v:'.hash('xxh128', implode("\0", ['redis', 'default', MetricName::JobsCompleted, 'App\Jobs\B']));
+    $store = new class($refusing) extends ArrayStore {
+        public function __construct(private string $refusing) {
+            parent::__construct();
+        }
+
+        public function increment($key, $value = 1) {
+            return $key === $this->refusing ? false : parent::increment($key, $value);
+        }
+
+        public function add($key, $value, $seconds): bool {
+            return $key === $this->refusing ? false : $this->put($key, $value, $seconds);
+        }
+    };
+    $counters = new Counters(new Repository($store), 'qm-edge');
+
+    $counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\B');
+
+    expect($counters->read('redis', 'default', MetricName::counters()))
+        ->toBe([MetricName::JobsCompleted => [Collector::OTHER => 1]]);
+});
+
+it('finds a class dropped from the registry at its next power of two', function (): void {
+    $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+    $this->store->forget('qm-test:c:'.hash('xxh128', "redis\0default"));
+
+    $this->counters->increment('redis', 'default', MetricName::JobsCompleted, 'App\Jobs\A');
+
+    expect($this->counters->classes('redis', 'default'))->toBe(['App\Jobs\A']);
 });

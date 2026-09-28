@@ -119,3 +119,33 @@ it('writes one newline terminated line per document to its stream', function ():
 
     expect($handle->fread(1024))->toBe("{\"a\":1}\n{\"b\":2}\n");
 });
+
+it('groups dimensions that are not valid UTF-8 without failing', function (): void {
+    $this->sink->write([Metric::make('JobsPending', 1, ['Connection' => 'redis', 'Queue' => "bad\xFF"])]);
+
+    expect($this->emitter->documents()[0]['Queue'])->toStartWith('bad#');
+});
+
+it('emits nothing from a batch that cannot be encoded in full', function (): void {
+    expect(fn () => $this->sink->write([
+        Metric::make('JobsPending', 1, queueLevel()),
+        Metric::make('JobsPending', INF, classLevel('App\Jobs\SendInvoice')),
+    ]))->toThrow(JsonException::class);
+
+    expect($this->emitter->lines)->toBeEmpty();
+});
+
+it('treats a short write as a failure', function (): void {
+    $handle = new class('php://memory', 'r+') extends SplFileObject {
+        public function fwrite(string $data, mixed $length = null): int|false {
+            return parent::fwrite(substr($data, 0, 3));
+        }
+    };
+
+    expect(fn () => (new StdoutEmitter($handle))->emit('{"a":1}'))->toThrow(RuntimeException::class, 'Unable to write');
+});
+
+it('refuses to write into /dev/null', function (): void {
+    expect(fn () => (new StdoutEmitter(new SplFileObject('/dev/null', 'wb')))->emit('{"a":1}'))
+        ->toThrow(RuntimeException::class, 'appendOutputTo');
+})->skipOnWindows();

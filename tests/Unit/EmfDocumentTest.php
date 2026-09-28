@@ -111,8 +111,8 @@ it('rejects an oversized metric name', function (): void {
 });
 
 it('strips control characters that would void the whole record', function (): void {
-    expect(EmfDocument::sanitise("Send\x00Invoice\x1F"))->toBe('SendInvoice')
-        ->and(EmfDocument::sanitise("a\nb"))->toBe('ab');
+    expect(EmfDocument::sanitise("Send\x00Invoice\x1F"))->toStartWith('SendInvoice#')
+        ->and(EmfDocument::sanitise("a\nb"))->toStartWith('a b#');
 });
 
 it('keeps a backslashed job class verbatim', function (): void {
@@ -123,9 +123,34 @@ it('folds an empty dimension value rather than voiding the record', function (st
     expect(EmfDocument::sanitise($value))->toBe(EmfDocument::UNKNOWN);
 })->with(['', '   ', "\t"]);
 
-it('truncates a long value on a character boundary', function (): void {
-    $value = EmfDocument::sanitise(str_repeat('é', 2000));
+it('keeps only the printable ASCII CloudWatch accepts', function (): void {
+    expect(EmfDocument::sanitise('Café'))->toMatch('/^Cafe#[0-9a-f]{8}$/')
+        ->and(EmfDocument::sanitise("App\\Jobs\\\xFF\xFEBad"))->toStartWith('App\\Jobs\\Bad#')
+        ->and(EmfDocument::sanitise("\u{202E}evil\u{009B}"))->toStartWith('evil#');
+});
 
-    expect(mb_strlen($value))->toBe(EmfDocument::MAX_DIMENSION_VALUE)
-        ->and(mb_check_encoding($value, 'UTF-8'))->toBeTrue();
+it('never collapses two names onto one series', function (): void {
+    expect(EmfDocument::sanitise('Отчёт'))->not->toBe(EmfDocument::sanitise('Счёт'))
+        ->and(EmfDocument::sanitise('Café'))->not->toBe(EmfDocument::sanitise('Cafe'));
+});
+
+it('truncates a long value to the dimension limit', function (): void {
+    expect(strlen(EmfDocument::sanitise(str_repeat('v', 2000))))->toBe(EmfDocument::MAX_DIMENSION_VALUE);
+});
+
+it('sanitises entity values and never lets one replace the metadata', function (): void {
+    $decoded = json_decode(
+        (new EmfDocument('Acme/Queues', 1, ['Queue' => 'default'], [Metric::make('JobsPending', 1, [])], [
+            '_aws' => 'broken', 'Service' => "check\nout",
+        ]))->toJson(),
+        true,
+        512,
+        JSON_THROW_ON_ERROR,
+    );
+
+    expect($decoded['_aws'])->toBeArray()->and($decoded['Service'])->toStartWith('check out#');
+});
+
+it('rejects a namespace with a trailing newline', function (): void {
+    expect(fn () => EmfDocument::assertNamespace("Laravel/Queue\n"))->toThrow(InvalidArgumentException::class);
 });

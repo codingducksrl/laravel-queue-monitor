@@ -37,6 +37,9 @@ abstract class TestCase extends Orchestra {
         // The failed job provider otherwise points at a sqlite file that the
         // test environment never creates.
         $app['config']->set('queue.failed.database', $connection);
+
+        $app['config']->set('queue-monitor.enabled', true);
+        $app['config']->set('queue-monitor.queues', ['database' => ['default']]);
     }
 
     /**

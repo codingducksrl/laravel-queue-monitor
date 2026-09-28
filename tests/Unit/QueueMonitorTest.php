@@ -4,40 +4,40 @@ declare(strict_types=1);
 
 use CodingDuck\QueueMonitor\QueueMonitor;
 use Illuminate\Config\Repository;
+use Illuminate\Container\Container;
 
-it('reads the enabled flag from config', function (): void {
-    $monitor = new QueueMonitor(new Repository(['queue-monitor' => ['enabled' => false]]));
+function monitor(array $config): QueueMonitor {
+    return new QueueMonitor(new Repository(['queue-monitor' => $config, 'queue' => [
+        'default' => 'redis',
+        'connections' => ['redis' => ['queue' => 'jobs'], 'sqs' => ['queue' => 'orders']],
+    ]]), new Container);
+}
 
-    expect($monitor->enabled())->toBeFalse();
+it('reads the enabled flag the way env() values arrive', function (mixed $value, bool $enabled): void {
+    expect(monitor(['enabled' => $value])->enabled())->toBe($enabled);
+})->with([
+    [true, true], ['1', true], ['true', true], ['on', true], ['yes', true],
+    [false, false], ['0', false], ['false', false], [null, false], ['', false],
+]);
+
+it('monitors the default queue of the default connection when none are listed', function (): void {
+    expect(monitor(['queues' => []])->sampledQueues())->toBe([['redis', 'jobs']]);
 });
 
-it('discards non-string connection entries', function (): void {
-    $monitor = new QueueMonitor(
-        new Repository(['queue-monitor' => ['enabled' => true, 'connections' => ['redis', 42, null]]])
-    );
-
-    expect($monitor->connections())->toBe(['redis']);
+it('reads connection to queue pairs', function (): void {
+    expect(monitor(['queues' => ['redis' => ['default', 'high'], 'sqs' => []]])->sampledQueues())
+        ->toBe([['redis', 'default'], ['redis', 'high'], ['sqs', 'orders']]);
 });
 
-it('monitors every connection when none are listed', function (): void {
-    $monitor = new QueueMonitor(new Repository(['queue-monitor' => ['enabled' => true, 'connections' => []]]));
-
-    expect($monitor->monitors('sqs'))->toBeTrue();
+it('accepts a single queue given as a string', function (): void {
+    expect(monitor(['queues' => ['redis' => 'high']])->sampledQueues())->toBe([['redis', 'high']]);
 });
 
-it('monitors only the listed connections', function (): void {
-    $monitor = new QueueMonitor(
-        new Repository(['queue-monitor' => ['enabled' => true, 'connections' => ['redis']]])
-    );
-
-    expect($monitor->monitors('redis'))->toBeTrue()
-        ->and($monitor->monitors('sqs'))->toBeFalse();
+it('drops empty and duplicate queue entries', function (): void {
+    expect(monitor(['queues' => ['redis' => ['high', '', 'high', 42]]])->sampledQueues())->toBe([['redis', 'high']]);
 });
 
-it('monitors nothing while disabled', function (): void {
-    $monitor = new QueueMonitor(
-        new Repository(['queue-monitor' => ['enabled' => false, 'connections' => ['redis']]])
-    );
-
-    expect($monitor->monitors('redis'))->toBeFalse();
+it('rejects a list where a connection map belongs', function (): void {
+    expect(fn (): array => monitor(['queues' => ['redis', 'sqs']])->sampledQueues())
+        ->toThrow(InvalidArgumentException::class, 'maps connection names');
 });
