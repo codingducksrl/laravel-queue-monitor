@@ -4,56 +4,67 @@ declare(strict_types=1);
 
 namespace CodingDuck\QueueMonitor;
 
+use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Queue\Factory;
+use Illuminate\Foundation\Cloud\FailedJobProvider as CloudFailedJobProvider;
 use Illuminate\Queue\Failed\CountableFailedJobProvider;
 use Illuminate\Queue\Failed\FailedJobProviderInterface;
-use Illuminate\Queue\Jobs\InspectedJob;
-use Illuminate\Support\Collection;
+use Illuminate\Queue\Failed\NullFailedJobProvider;
+use Illuminate\Queue\SyncQueue;
+use ReflectionProperty;
+use Throwable;
 
 final readonly class Collector {
-    public const string OTHER = '__other__';
-
     public function __construct(
         private Factory $queues,
         private Counters $counters,
         private FailedJobProviderInterface $failer,
-        private int $maxClasses = 25,
+        private ExceptionHandler $handler,
+        private QueueMonitor $monitor,
     ) {}
 
     /**
-     * Returns the metrics to publish and the counter readings they were built
-     * from. The caller commits the readings only once the sink has accepted
-     * them, so a failed write loses nothing.
-     *
-     * @return array{0: list<Metric>, 1: array<string, array<string, int>>}
+     * @return array{0: list<Metric>, 1: array<string, array<string, int>>} the metrics, and the readings to commit once they are published
      */
     public function collect(string $connection, string $queue): array {
         $dimensions = ['Connection' => $connection, 'Queue' => $queue];
         $driver = $this->queues->connection($connection);
 
         $metrics = [
-            Metric::make(MetricName::JobsPending, $driver->pendingSize($queue), $dimensions),
-            Metric::make(MetricName::JobsDelayed, $driver->delayedSize($queue), $dimensions),
-            Metric::make(MetricName::JobsInProgress, $driver->reservedSize($queue), $dimensions),
+            new Metric(MetricName::JobsPending, $driver->pendingSize($queue), $dimensions),
+            new Metric(MetricName::JobsDelayed, $driver->delayedSize($queue), $dimensions),
+            new Metric(MetricName::JobsInProgress, $driver->reservedSize($queue), $dimensions),
         ];
 
-        if ($this->failer instanceof CountableFailedJobProvider) {
-            $metrics[] = Metric::make(
-                MetricName::FailedJobsTotal, (int) $this->failer->count($connection, $queue), $dimensions
-            );
+        // Database and beanstalkd jobs record a forwarded queue's target, Redis
+        // jobs the name their worker was started with, so count both.
+        $failed = $this->failedJobs($connection, array_values(array_unique([$queue, $this->monitor->physicalQueue($connection, $queue)])));
+
+        if ($failed !== null) {
+            $metrics[] = new Metric(MetricName::FailedJobsTotal, $failed, $dimensions);
         }
 
-        foreach ($this->reservedByClass($driver, $queue) as $class => $count) {
-            $metrics[] = Metric::make(MetricName::JobsInProgress, $count, [...$dimensions, 'JobClass' => $class]);
+        // Counters exist only for monitored queues.
+        if (! in_array([$connection, $queue], $this->monitor->sampledQueues(), true)) {
+            return [$metrics, []];
         }
 
-        $readings = $this->counters->read($connection, $queue, MetricName::counters());
+        $classes = $this->counters->classes($connection, $queue);
+        $readings = $this->counters->read($connection, $queue, $classes);
+        $max = $this->monitor->maxJobClasses();
+        $keep = array_flip(array_slice(array_values(array_diff($classes, [Counters::OTHER])), 0, $max));
 
-        foreach ($this->fold($readings) as $metric => $classes) {
-            $metrics[] = Metric::make($metric, array_sum($classes), $dimensions);
+        foreach (MetricName::COUNTERS as $metric) {
+            // Sync connections never fire JobQueued.
+            if ($metric === MetricName::JobsQueued && $driver instanceof SyncQueue) {
+                continue;
+            }
 
-            foreach ($classes as $class => $value) {
-                $metrics[] = Metric::make($metric, $value, [...$dimensions, 'JobClass' => $class]);
+            $counts = $readings[$metric] ?? [];
+            $metrics[] = new Metric($metric, array_sum($counts), $dimensions);
+
+            foreach ($max > 0 ? $this->fold($counts, $keep) : [] as $class => $value) {
+                $metrics[] = new Metric($metric, $value, [...$dimensions, 'JobClass' => (string) $class]);
             }
         }
 
@@ -61,68 +72,49 @@ final readonly class Collector {
     }
 
     /**
-     * Keep the busiest classes and relabel the rest, so the per-class values
-     * still sum to the queue level total.
+     * @param array<array-key, int> $counts
+     * @param array<string, int>    $keep
      *
-     * @param array<string, array<string, int>> $readings
-     *
-     * @return array<string, array<string, int>>
+     * @return array<string, int>
      */
-    private function fold(array $readings): array {
-        $totals = [];
-
-        foreach ($readings as $classes) {
-            foreach ($classes as $class => $value) {
-                $totals[$class] = ($totals[$class] ?? 0) + $value;
-            }
-        }
-
-        if (count($totals) <= $this->maxClasses) {
-            return $readings;
-        }
-
-        uksort($totals, fn (string $a, string $b): int => [$totals[$b], $a] <=> [$totals[$a], $b]);
-
-        $keep = array_slice(array_keys($totals), 0, $this->maxClasses);
+    private function fold(array $counts, array $keep): array {
         $folded = [];
 
-        foreach ($readings as $metric => $classes) {
-            foreach ($classes as $class => $value) {
-                $label = in_array($class, $keep, true) ? $class : self::OTHER;
-
-                $folded[$metric][$label] = ($folded[$metric][$label] ?? 0) + $value;
-            }
+        foreach ($counts as $class => $value) {
+            $label = isset($keep[$class]) ? (string) $class : Counters::OTHER;
+            $folded[$label] = ($folded[$label] ?? 0) + $value;
         }
 
         return $folded;
     }
 
     /**
-     * Bounded by the number of workers, so cheap. Drivers that cannot inspect
-     * jobs return an empty list and no per-class metric is published.
+     * Null when the provider cannot count, fails, or only ever answers zero,
+     * as Cloud's does for its managed queues, whose failures it never stores.
      *
-     * @return array<string, int>
+     * @param list<string> $queues
      */
-    private function reservedByClass(object $driver, string $queue): array {
-        if (! method_exists($driver, 'reservedJobs')) {
-            return [];
-        }
+    private function failedJobs(string $connection, array $queues): ?int {
+        try {
+            // Cloud wraps the application's provider and answers zero for one
+            // that cannot count, so judge the provider it wraps.
+            $failer = $this->failer instanceof CloudFailedJobProvider
+                ? (new ReflectionProperty(CloudFailedJobProvider::class, 'failer'))->getValue($this->failer)
+                : $this->failer;
 
-        /** @var mixed $reserved */
-        $reserved = $driver->reservedJobs($queue);
-
-        if (! $reserved instanceof Collection) {
-            return [];
-        }
-
-        $counts = [];
-
-        foreach ($reserved as $job) {
-            if ($job instanceof InspectedJob && $job->name !== null) {
-                $counts[$job->name] = ($counts[$job->name] ?? 0) + 1;
+            if (
+                ! $failer instanceof CountableFailedJobProvider
+                || $failer instanceof NullFailedJobProvider
+                || ($this->failer instanceof CloudFailedJobProvider && $connection === 'cloud')
+            ) {
+                return null;
             }
-        }
 
-        return $counts;
+            return array_sum(array_map(fn (string $queue): int => (int) $failer->count($connection, $queue), $queues));
+        } catch (Throwable $e) {
+            $this->handler->report($e);
+
+            return null;
+        }
     }
 }

@@ -18,14 +18,15 @@ final class RecordingSink implements MetricSink {
         $this->metrics = [...$this->metrics, ...$metrics];
     }
 
-    public function value(string $name, ?string $class = null): int|float|null {
-        foreach ($this->metrics as $metric) {
-            if ($metric->name === $name && ($metric->dimensions['JobClass'] ?? null) === $class) {
-                return $metric->value;
-            }
-        }
+    public function value(string $name, ?string $class = null): ?int {
+        $matches = array_values(array_filter(
+            $this->metrics,
+            fn (Metric $metric): bool => $metric->name === $name && ($metric->dimensions['JobClass'] ?? null) === $class,
+        ));
 
-        return null;
+        expect(count($matches))->toBeLessThanOrEqual(1);
+
+        return $matches[0]->value ?? null;
     }
 
     /**

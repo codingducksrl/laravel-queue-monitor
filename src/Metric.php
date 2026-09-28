@@ -10,15 +10,7 @@ final readonly class Metric {
      */
     public function __construct(
         public string $name,
-        public int|float $value,
-        public Unit $unit,
+        public int $value,
         public array $dimensions,
     ) {}
-
-    /**
-     * @param array<string, string> $dimensions
-     */
-    public static function make(string $name, int|float $value, array $dimensions, Unit $unit = Unit::Count): self {
-        return new self($name, $value, $unit, $dimensions);
-    }
 }

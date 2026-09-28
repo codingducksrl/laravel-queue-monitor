@@ -8,35 +8,25 @@ return [
     | Monitoring switch
     |--------------------------------------------------------------------------
     |
-    | Turns the package on or off wholesale. When false, no queue events are
-    | observed and nothing is recorded, which is the cheapest way to take the
-    | package out of a hot path without uninstalling it.
+    | Off until you turn it on, so installing the package costs nothing before
+    | a counter store is chosen. When false no queue events are observed and
+    | nothing is recorded.
     |
     */
 
-    'enabled' => env('QUEUE_MONITOR_ENABLED', true),
+    'enabled' => env('QUEUE_MONITOR_ENABLED', false),
 
     /*
     |--------------------------------------------------------------------------
-    | Monitored connections
+    | Monitored queues
     |--------------------------------------------------------------------------
     |
-    | The queue connections to monitor, by name as they appear in the
-    | application's `queue.connections` config. An empty list monitors every
-    | connection.
-    |
-    */
-
-    'connections' => [],
-
-    /*
-    |--------------------------------------------------------------------------
-    | Sampled queues
-    |--------------------------------------------------------------------------
-    |
-    | Depth is pulled rather than pushed, so the sampler has to be told which
-    | queues to read: no driver exposes a cheap way to enumerate them. Keys are
-    | connection names, values the queues on that connection.
+    | The queues to count and sample, keyed by connection name. Throughput is
+    | counted only for these pairs, because a counter nobody samples would cost
+    | a cache write per job and never be published. An empty map monitors the
+    | default queue of the default connection. A failover connection is
+    | monitored as its first connection, the one it pushes to and pops from,
+    | and a background connection as sync, which runs its jobs.
     |
     |     'queues' => ['redis' => ['default', 'high']],
     |
@@ -49,41 +39,35 @@ return [
     | Metric sink
     |--------------------------------------------------------------------------
     |
-    | Where samples are delivered: 'emf', 'null', or any driver registered with
+    | Where samples are delivered: 'emf', or any driver registered with
     | MetricSinkManager::extend().
     |
     */
 
-    'sink' => env('QUEUE_MONITOR_SINK', 'null'),
+    'sink' => env('QUEUE_MONITOR_SINK', 'emf'),
 
     /*
     |--------------------------------------------------------------------------
     | CloudWatch Embedded Metric Format
     |--------------------------------------------------------------------------
     |
-    | Writes one JSON line per dimension tuple. Nothing is sent to AWS from here
-    | and no SDK is involved: the platform's log driver ships the line to
-    | CloudWatch Logs, which extracts the metrics.
+    | Writes one JSON line per dimension tuple to stdout. Nothing is sent to
+    | AWS from here and no SDK is involved: the platform's log driver ships the
+    | line to CloudWatch Logs, which extracts the metrics.
     |
-    | Leaving `channel` null writes to php://stdout. Setting it routes through a
-    | Laravel log channel, which MUST emit the raw message: the default
-    | formatter's "[2026-01-01 00:00:00] production.INFO:" prefix makes the line
-    | unparseable and the metrics silently disappear.
-    |
-    | CloudWatch bills per custom metric, and a custom metric is one metric name
-    | paired with one dimension tuple. `max_job_classes` is what bounds that.
+    | The scheduler sends a command's output to /dev/null unless told
+    | otherwise, so schedule the sampler with ->appendOutputTo(...); the
+    | sampler refuses to drain the counters into /dev/null.
     |
     */
 
     'emf' => [
         'namespace' => env('QUEUE_MONITOR_NAMESPACE', 'Laravel/Queue'),
 
-        'channel' => env('QUEUE_MONITOR_EMF_CHANNEL'),
-
         'entity' => array_filter([
             'Service' => env('QUEUE_MONITOR_SERVICE'),
             'Environment' => env('QUEUE_MONITOR_ENVIRONMENT'),
-        ], is_string(...)),
+        ], filled(...)),
     ],
 
     /*
@@ -95,28 +79,31 @@ return [
     | store, so nothing accumulates in PHP memory and a worker killed mid-job
     | loses nothing but the job it was running.
     |
-    | The store must increment atomically across processes. `array` is a
-    | per-process buffer and `file` is not atomic under concurrency; both are
-    | rejected at boot. Null uses the application's default store.
+    | Use a redis store with a connection of its own: neither its connection
+    | nor its lock_connection may be one a Redis queue uses. DynamoDB also
+    | works. Any other store is refused when first used.
     |
     */
 
     'counters' => [
         'store' => env('QUEUE_MONITOR_CACHE_STORE'),
 
-        'prefix' => 'queue-monitor',
+        'prefix' => env('QUEUE_MONITOR_CACHE_PREFIX', 'queue-monitor'),
     ],
 
     /*
     |--------------------------------------------------------------------------
-    | Job class cardinality
+    | Job class dimension
     |--------------------------------------------------------------------------
     |
-    | The busiest job classes keep their own JobClass dimension; the rest are
-    | folded into a single bucket so the per-class values still add up to the
-    | queue total.
+    | JobsQueued, JobsCompleted and JobsFailed are also published per job
+    | class. The first classes seen on a queue keep their own JobClass
+    | dimension; the rest are folded into a single bucket, so the per-class
+    | values still add up to the queue total and the set of published metrics
+    | stays fixed. Every class adds CloudWatch custom metrics; 0 publishes
+    | the queue totals only.
     |
     */
 
-    'max_job_classes' => 25,
+    'max_job_classes' => env('QUEUE_MONITOR_MAX_JOB_CLASSES', 25),
 ];
