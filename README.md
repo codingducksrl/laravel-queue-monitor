@@ -28,8 +28,7 @@ QUEUE_MONITOR_CACHE_STORE=metrics
 ```
 
 `metrics` is a Redis cache store with a connection of its own, defined as shown under
-[Counter store](#counter-store). Laravel's stock `redis` store is refused: its
-`lock_connection` is `default`, the connection the Redis queue uses.
+[Counter store](#counter-store). Laravel's stock `redis` store works too, but has no timeouts.
 
 ```php
 // config/queue-monitor.php
@@ -200,10 +199,14 @@ that way, or because the registry lock was busy, keeps counting and is published
 its next events registers it again, at most 100 events later.
 
 Every other store is refused, and so is a Redis store whose connection or `lock_connection` is
-not defined or is also used by a Redis queue: bulk dispatch pushes inside a `MULTI` on that
-connection, where a counter command is only queued. A refused store counts nothing and is
-reported like any other store failure; `queue-monitor:status` fails. The check is skipped
-while running tests (`APP_ENV=testing`).
+not defined. A refused store counts nothing and is reported like any other store failure;
+`queue-monitor:status` fails. The check is skipped while running tests (`APP_ENV=testing`).
+
+Sharing a connection with a Redis queue works, with one caveat: with phpredis, a bulk dispatch
+(`Bus::batch()`, `Bus::bulk()`, `Queue::bulk()`) pushes inside a `MULTI` on the queue's
+connection, where a counter command is only queued. If the counters use that same connection,
+such a push is reported as a store failure and counting pauses for a minute in that process.
+A shared `lock_connection` alone, as in the stock `redis` store, is harmless.
 
 Give the counters a Redis connection of their own, with tight timeouts, so a slow Redis cannot
 hold up your requests. Without `timeout` and `read_timeout`, phpredis falls back to PHP's

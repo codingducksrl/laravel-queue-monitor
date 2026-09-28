@@ -63,10 +63,7 @@ class QueueMonitorServiceProvider extends ServiceProvider {
     }
 
     /**
-     * Counters must increment atomically across processes and take locks. A
-     * Redis store must not share a connection with a Redis queue: bulk
-     * dispatch pushes inside a MULTI there, where a counter or lock command
-     * is only queued.
+     * Counters must increment atomically across processes and take locks.
      */
     private function guardCounterStore(Application $app, Store $store, string $name): void {
         if ($app->runningUnitTests() || $store instanceof DynamoDbStore) {
@@ -79,21 +76,10 @@ class QueueMonitorServiceProvider extends ServiceProvider {
 
         $config = $app->make(Repository::class);
         $connection = $config->get("cache.stores.{$name}.connection");
-        $ours = array_unique([self::redisName($connection), self::redisName($config->get("cache.stores.{$name}.lock_connection") ?? $connection)]);
 
-        foreach ($ours as $redis) {
+        foreach ([self::redisName($connection), self::redisName($config->get("cache.stores.{$name}.lock_connection") ?? $connection)] as $redis) {
             if (! $config->has("database.redis.{$redis}") && ! $config->has("database.redis.clusters.{$redis}")) {
                 throw new RuntimeException("The queue-monitor counter store uses the [{$redis}] Redis connection, which database.redis does not define.");
-            }
-        }
-
-        foreach ((array) $config->get('queue.connections') as $queue) {
-            $theirs = is_array($queue) && ($queue['driver'] ?? null) === 'redis' ? self::redisName($queue['connection'] ?? null) : null;
-
-            if (in_array($theirs, $ours, true)) {
-                throw new RuntimeException(
-                    "The queue-monitor counter store shares the [{$theirs}] Redis connection with a queue; give it a connection and lock_connection of its own."
-                );
             }
         }
     }

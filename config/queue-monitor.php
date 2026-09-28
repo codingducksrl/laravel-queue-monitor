@@ -79,9 +79,9 @@ return [
     | store, so nothing accumulates in PHP memory and a worker killed mid-job
     | loses nothing but the job it was running.
     |
-    | Use a redis store with a connection of its own: neither its connection
-    | nor its lock_connection may be one a Redis queue uses. DynamoDB also
-    | works. Any other store is refused when first used.
+    | Use a redis store, ideally with a connection of its own and tight
+    | timeouts. DynamoDB also works. Any other store is refused when first
+    | used.
     |
     */
 

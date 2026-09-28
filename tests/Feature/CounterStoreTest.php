@@ -18,6 +18,7 @@ afterEach(function (): void {
 function counterStore(array $store): Counters {
     app()['env'] = 'production';
     config()->set('database.redis.metrics', ['host' => '127.0.0.1']);
+    config()->set('database.redis.cache', ['host' => '127.0.0.1']);
     config()->set('cache.stores.counters', $store);
     config()->set('queue-monitor.counters.store', 'counters');
     app()->forgetInstance(Counters::class);
@@ -39,22 +40,23 @@ it('accepts a redis store with a connection of its own', function (): void {
         ->toBeInstanceOf(Counters::class);
 });
 
-it('refuses a redis store that shares a connection with a redis queue', function (array $store, array $queue): void {
-    config()->set('queue.connections.redis', ['driver' => 'redis', 'queue' => 'default', ...$queue]);
+it('accepts a redis store that shares a connection with a redis queue', function (array $store): void {
+    config()->set('queue.connections.redis', ['driver' => 'redis', 'connection' => 'default', 'queue' => 'default']);
 
-    expect(fn (): Counters => counterStore($store))->toThrow(RuntimeException::class, 'shares the [default] Redis connection');
+    expect(counterStore($store))->toBeInstanceOf(Counters::class);
 })->with([
-    'connection' => [['driver' => 'redis', 'connection' => 'default', 'lock_connection' => 'metrics'], ['connection' => 'default']],
-    'lock connection' => [['driver' => 'redis', 'connection' => 'metrics', 'lock_connection' => 'default'], ['connection' => 'default']],
-    'inherited lock connection' => [['driver' => 'redis', 'connection' => 'default'], ['connection' => 'default']],
-    'stock defaults' => [['driver' => 'redis'], []],
-    'empty names' => [['driver' => 'redis', 'connection' => 'metrics', 'lock_connection' => ''], ['connection' => '']],
+    'stock defaults' => [['driver' => 'redis', 'connection' => 'cache', 'lock_connection' => 'default']],
+    'same connection' => [['driver' => 'redis']],
+    'empty names' => [['driver' => 'redis', 'connection' => '', 'lock_connection' => '']],
 ]);
 
-it('refuses a redis store whose connection is not defined', function (): void {
-    expect(fn (): Counters => counterStore(['driver' => 'redis', 'connection' => 'metircs']))
+it('refuses a redis store whose connection is not defined', function (array $store): void {
+    expect(fn (): Counters => counterStore($store))
         ->toThrow(RuntimeException::class, '[metircs] Redis connection, which database.redis does not define');
-});
+})->with([
+    'connection' => [['driver' => 'redis', 'connection' => 'metircs']],
+    'lock connection' => [['driver' => 'redis', 'connection' => 'metrics', 'lock_connection' => 'metircs']],
+]);
 
 it('keeps four times the published classes in the registry', function (): void {
     config()->set('queue-monitor.max_job_classes', 1);
